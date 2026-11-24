@@ -24,7 +24,7 @@
 # No param() block: options such as -Out / -Kind arrive as-is in $args.
 $Command = @($args | ForEach-Object { "$_" })
 
-$script:GhVersion = '1.3'
+$script:GhVersion = '1.13'
 
 # ---------------------------------------------------------------------------
 #  Binary engine (C#): .vdb reading, decompression, PNG writing
@@ -50,7 +50,7 @@ using System.Text.RegularExpressions;
 
 namespace GhTool
 {
-    public class Thumb  { public long Offset; public int Length; public int Width; public int Height; }
+    public class Thumb  { public long Offset; public int Length; public int Width; public int Height; public string Name; public byte[] Bytes; }
     public class Chunk  { public long Offset; public int CompLen; public int RawLen; }
 
     public class VdbInfo
@@ -62,6 +62,9 @@ namespace GhTool
         public int Width, Height, GlFormat, Channels, PixelOffset, PixelLength;
         public List<Thumb> Thumbs = new List<Thumb>();
         public List<Chunk> Chunks = new List<Chunk>();
+        public int MipLevels, TypeCode;
+        public string PixelSection, PreviewSize;
+        public List<Vdb.Sec> SectionList;
         public int ThumbCount { get { return Thumbs.Count; } }
         public int ChunkCount { get { return Chunks.Count; } }
     }
@@ -200,6 +203,8 @@ namespace GhTool
             }
         }
 
+        public static void ParsePayloadHeaderPublic(byte[] pl, VdbInfo info) { ParsePayloadHeader(pl, info); }
+
         static void ParsePayloadHeader(byte[] pl, VdbInfo info)
         {
             int lim = Math.Min(pl.Length, 16384);
@@ -255,6 +260,8 @@ namespace GhTool
                         info.Modified = Ts(U32(head, 0x190));
                     }
 
+                    if (!TryContainer(fs, head, info))
+                    {
                     // Section table: [u16 count][u16 idx][u32 flag][u32 len][name] ...
                     int scanStart = Math.Min(headLen, 0x2A0);
                     if (headLen >= 8)
@@ -319,9 +326,11 @@ namespace GhTool
                         break;
                     }
 
+                    }
+
                     // XML version block (at the end of the file)
                     int tl = (int)Math.Min(fs.Length, 16384);
-                    string tail = Encoding.GetEncoding(28591).GetString(ReadAt(fs, fs.Length - tl, tl));
+                    string tail = info.AppName != null ? "" : Encoding.GetEncoding(28591).GetString(ReadAt(fs, fs.Length - tl, tl));
                     Match m = Regex.Match(tail, "<version>(.*?)</version>", RegexOptions.Singleline);
                     if (m.Success)
                     {
@@ -335,11 +344,430 @@ namespace GhTool
                     }
                     if (info.Sections == null) { info.Name = null; info.Created = null; info.Modified = null; }
                     if (info.Chunks.Count == 0 && info.Sections == null) info.Kind = "Unknown";
-                    else if (info.Chunks.Count == 0) info.Kind = "No data";
+                    else if (info.Chunks.Count == 0 && info.Kind != "Image" && info.Kind != "Scene" && info.Kind != "Material" && info.Kind != "Font" && info.Kind != "Other") info.Kind = "No data";
                 }
             }
             catch (Exception ex) { info.Error = ex.Message; info.Kind = "Error"; }
             return info;
+        }
+
+        // ---- Container reading (section table + directory), works for old and new .vdb ----
+        public class Sec { public int Id; public string Name; public string Attr; public long Offset; public long Length; }
+
+        static bool ChunkOkAny(byte[] h, int p, long posInFile, long limit)
+        {
+            if (p + 10 > h.Length) return false;
+            uint c = U32(h, p), r = U32(h, p + 4);
+            if (c < 9 || posInFile + c > limit) return false;
+            if (r == 0 || r > 536870912u) return false;
+            if (c - 8 == r) return true;                       // stored (uncompressed) chunk
+            if (h[p + 8] != 0x78) return false;
+            return ((0x78 << 8) | h[p + 9]) % 31 == 0;
+        }
+
+        public static List<Sec> ReadSections(FileStream fs, byte[] head)
+        {
+            if (head.Length < 0x20) return null;
+            uint st = U32(head, 4), dir = U32(head, 8), tail = U32(head, 0x10);
+            if (st < 8 || st + 2 >= head.Length || dir >= fs.Length || tail > fs.Length || tail <= dir) return null;
+            // section table: u16 count; entries: u16 idx, u32 type, u32 len, name [, u16 nAttr, (u32 len, text)*]
+            int p = (int)st, cnt = U16(head, p); p += 2;
+            if (cnt < 1 || cnt > 256) return null;
+            Dictionary<int, Sec> byId = new Dictionary<int, Sec>();
+            for (int i = 0; i < cnt; i++)
+            {
+                if (p + 10 > head.Length) return null;
+                int idx = U16(head, p); uint type = U32(head, p + 2), l = U32(head, p + 6); p += 10;
+                if (l == 0 || l > 64 || p + l > head.Length) return null;
+                Sec s = new Sec(); s.Id = idx; s.Name = Encoding.ASCII.GetString(head, p, (int)l); p += (int)l;
+                if (!Regex.IsMatch(s.Name, "^[A-Za-z0-9_.]+$")) return null;
+                if (type < 1 || type > 64) return null;
+                List<string> at = new List<string>();
+                for (int k = 1; k < type; k++)
+                {
+                    if (p + 6 > head.Length) return null;
+                    uint al = U32(head, p + 2); p += 6;
+                    if (al > 256 || p + al > head.Length) return null;
+                    at.Add(Encoding.ASCII.GetString(head, p, (int)al)); p += (int)al;
+                }
+                if (at.Count > 0) s.Attr = string.Join(";", at.ToArray());
+                byId[idx] = s;
+            }
+            // directory
+            byte[] d = ReadAt(fs, dir, (int)(tail - dir));
+            int q = 0, n = U16(d, q); q += 2;
+            List<Sec> res = new List<Sec>();
+            for (int s = 0; s < n; s++)
+            {
+                if (q + 6 > d.Length) return null;
+                int id = U16(d, q); int pages = (int)U32(d, q + 2); q += 6;
+                long start = -1, len = 0, expect = -1;
+                for (int k = 0; k < pages; k++)
+                {
+                    if (q + 13 > d.Length) return null;
+                    uint size = U32(d, q + 4), off = U32(d, q + 8); q += 13;
+                    if (start < 0) start = off;
+                    if (expect >= 0 && off != expect) return null;
+                    len += size; expect = off + size;
+                }
+                Sec sec;
+                if (!byId.TryGetValue(id, out sec)) { sec = new Sec(); sec.Id = id; sec.Name = "Section" + id; }
+                sec.Offset = start < 0 ? 0 : start; sec.Length = len;
+                res.Add(sec);
+            }
+            if (q != d.Length) return null;
+            return res;
+        }
+
+        public static List<Chunk> SectionChunks(FileStream fs, Sec s)
+        {
+            List<Chunk> list = new List<Chunk>();
+            long q = s.Offset, end = s.Offset + s.Length;
+            while (q + 10 <= end)
+            {
+                byte[] hh = ReadAt(fs, q, 10);
+                if (!ChunkOkAny(hh, 0, q, end)) return null;
+                Chunk ck = new Chunk(); ck.Offset = q; ck.CompLen = (int)U32(hh, 0); ck.RawLen = (int)U32(hh, 4);
+                list.Add(ck); q += ck.CompLen;
+            }
+            return q == end ? list : null;
+        }
+
+        static byte[] ReadChunk(FileStream fs, Chunk c)
+        {
+            byte[] comp = ReadAt(fs, c.Offset, c.CompLen);
+            if (c.CompLen - 8 == c.RawLen) { byte[] r = new byte[c.RawLen]; Buffer.BlockCopy(comp, 8, r, 0, c.RawLen); return r; }
+            return Inflate(comp, 10, c.CompLen - 10, c.RawLen);
+        }
+
+        static bool TryContainer(FileStream fs, byte[] head, VdbInfo info)
+        {
+            List<Sec> secs;
+            try { secs = ReadSections(fs, head); } catch { return false; }
+            if (secs == null || secs.Count == 0) return false;
+            info.SectionList = secs;
+            List<string> names = new List<string>();
+            foreach (Sec s in secs) names.Add(s.Name);
+            info.Sections = string.Join(",", names.ToArray());
+
+            VdbInfo preview = null;
+            foreach (Sec s in secs)
+            {
+                if (s.Name.StartsWith("Icon") && s.Length > 0 && s.Length < 8388608)
+                {
+                    List<Chunk> ch = SectionChunks(fs, s);
+                    if (ch == null) continue;
+                    MemoryStream ms = new MemoryStream();
+                    foreach (Chunk c in ch) { byte[] cb = ReadChunk(fs, c); if (cb != null) ms.Write(cb, 0, cb.Length); }
+                    byte[] b = ms.ToArray();
+                    if (info.TypeCode == 0 && b.Length > 3 && b[0] == 0xFE) info.TypeCode = (b[1] << 8) | b[2];
+                    for (int i = 0; i + 4 < b.Length; i++)
+                    {
+                        if (b[i] == 0xFF && b[i + 1] == 0xD8 && b[i + 2] == 0xFF)
+                        {
+                            int w, h; int e = JpegEnd(b, i, b.Length, out w, out h);
+                            if (e > 0)
+                            {
+                                Thumb t = new Thumb(); t.Length = e - i; t.Width = w; t.Height = h; t.Name = s.Name;
+                                t.Bytes = new byte[e - i]; Buffer.BlockCopy(b, i, t.Bytes, 0, e - i);
+                                info.Thumbs.Add(t);
+                            }
+                            break;
+                        }
+                    }
+                }
+                else if (s.Name.StartsWith("MMLevel")) info.MipLevels++;
+                else if (s.Name == "VERSION" && s.Length > 0 && s.Length < 1048576)
+                {
+                    string x = Encoding.GetEncoding(28591).GetString(ReadAt(fs, s.Offset, (int)s.Length));
+                    Match a;
+                    a = Regex.Match(x, "<dbi>.*?<ver>(.*?)</ver>"); if (a.Success) info.DbVersion = a.Groups[1].Value;
+                    a = Regex.Match(x, "<app>.*?<name>(.*?)</name>.*?<ver>(.*?)</ver>");
+                    if (a.Success) { info.AppName = a.Groups[1].Value; info.AppVersion = a.Groups[2].Value; }
+                    a = Regex.Match(x, "<sys>.*?<name>(.*?)</name>.*?<ver>(.*?)</ver>");
+                    if (a.Success) { info.SysName = a.Groups[1].Value; info.SysVersion = a.Groups[2].Value; }
+                }
+            }
+
+            // Pixel source: "Original" (full resolution, newer files) or "Data" (older files / preview)
+            VdbInfo best = null; List<Chunk> bestChunks = null; Sec bestSec = null;
+            foreach (string want in new string[] { "Data", "Original" })
+            {
+                foreach (Sec s in secs)
+                {
+                    if (s.Name != want || s.Length < 10) continue;
+                    List<Chunk> ch = SectionChunks(fs, s);
+                    if (ch == null || ch.Count == 0) continue;
+                    byte[] raw = ReadChunk(fs, ch[0]);
+                    if (raw == null) continue;
+                    VdbInfo t = new VdbInfo(); ParsePayloadHeader(raw, t);
+                    if (want == "Data") { info.Name2 = t.Name2; if (raw.Length > 3 && raw[0] == 0xFE) info.TypeCode = (raw[1] << 8) | raw[2]; if (best == null) { info.Chunks = ch; foreach (Chunk c in ch) info.RawSize += c.RawLen; } }
+                    if (t.Kind == "Image")
+                    {
+                        if (want == "Data") preview = t;
+                        if (best == null || (long)t.Width * t.Height > (long)best.Width * best.Height) { best = t; bestChunks = ch; bestSec = s; }
+                    }
+                }
+            }
+            if (best != null)
+            {
+                info.Kind = "Image"; info.Width = best.Width; info.Height = best.Height; info.GlFormat = best.GlFormat;
+                info.Channels = best.Channels; info.PixelFormat = best.PixelFormat; info.PixelOffset = best.PixelOffset; info.PixelLength = best.PixelLength;
+                info.Chunks = bestChunks; info.RawSize = 0; foreach (Chunk c in bestChunks) info.RawSize += c.RawLen;
+                info.PixelSection = bestSec.Name;
+                if (preview != null && bestSec.Name != "Data") info.PreviewSize = preview.Width + "x" + preview.Height;
+            }
+            else if (info.TypeCode == 0x0690) info.Kind = "Scene";
+            else if (info.TypeCode == 0x0480) info.Kind = "Font";
+            else if (info.TypeCode == 0x0600) info.Kind = "Material";
+            else if (info.Chunks.Count > 0 || info.Thumbs.Count > 0) info.Kind = "Other";
+            else info.Kind = "No data";
+            return true;
+        }
+
+        // ---- Scene summary (names found in the scene data; format not documented) ----
+        public class SceneSummary
+        {
+            public List<string> Containers = new List<string>();
+            public List<string> Plugins = new List<string>();
+            public List<string> Directors = new List<string>();
+            public List<string> ControlFields = new List<string>();
+            public List<string> References = new List<string>();
+            public int TypeCode;
+        }
+
+        static List<string> TagStrings(byte[] d, int hi, int lo)
+        {
+            List<string> r = new List<string>();
+            for (int i = 0; i + 5 < d.Length; i++)
+            {
+                if (d[i] != 0xFE || d[i + 1] != hi || d[i + 2] != lo) continue;
+                int L = d[i + 3] | (d[i + 4] << 8);
+                if (L < 1 || L > 512 || i + 5 + L > d.Length) continue;
+                bool ok = true;
+                for (int k = 0; k < L; k++) { byte c = d[i + 5 + k]; if (c < 32 && c != 9) { ok = false; break; } }
+                if (!ok) continue;
+                r.Add(Encoding.UTF8.GetString(d, i + 5, L));
+                i += 4 + L;
+            }
+            return r;
+        }
+
+        public static byte[] ReadSectionPayload(VdbInfo info, string name)
+        {
+            if (info.SectionList == null) return null;
+            using (FileStream fs = OpenRead(info.Path))
+            {
+                foreach (Sec s in info.SectionList)
+                {
+                    if (s.Name != name || s.Length == 0) continue;
+                    List<Chunk> ch = SectionChunks(fs, s);
+                    if (ch == null) return null;
+                    MemoryStream o = new MemoryStream();
+                    foreach (Chunk c in ch) { byte[] b = ReadChunk(fs, c); if (b == null) return null; o.Write(b, 0, b.Length); }
+                    return o.ToArray();
+                }
+            }
+            return null;
+        }
+
+        public static SceneSummary Scene(VdbInfo info)
+        {
+            SceneSummary r = new SceneSummary();
+            r.TypeCode = info.TypeCode;
+            byte[] d = ReadSectionPayload(info, "Data");
+            if (d != null)
+            {
+                r.Containers = TagStrings(d, 0x03, 0x17);
+                foreach (string p in TagStrings(d, 0x06, 0x23)) if (!r.Plugins.Contains(p)) r.Plugins.Add(p);
+                r.Directors = TagStrings(d, 0x04, 0x22);
+                foreach (Match m in Regex.Matches(Encoding.GetEncoding(28591).GetString(d), "(IMAGE|GEOM|FONT|MATERIAL|SCENE|MAT|AUDIO)\\*[^\\x00-\\x1f*:\"<>]{1,200}"))
+                    if (!r.References.Contains(m.Value) && !m.Value.Contains(" ")) r.References.Add(m.Value);
+            }
+            byte[] x = ReadSectionPayload(info, "ExtraData");
+            if (x != null)
+            {
+                string t = Encoding.UTF8.GetString(x);
+                foreach (Match m in Regex.Matches(t, "<fielddef name=\"([^\"]*)\"(?: label=\"([^\"]*)\")?"))
+                    r.ControlFields.Add(m.Groups[2].Success && m.Groups[2].Value != "" ? m.Groups[1].Value + " (" + m.Groups[2].Value + ")" : m.Groups[1].Value);
+            }
+            return r;
+        }
+
+        // ---- Scene data: nested tag stream (FE + u16 tag opens, FE + ~tag closes, FE 00 05 + u32 len = blob) ----
+        public class TNode { public int Tag; public List<byte> Data = new List<byte>(); public List<TNode> Kids = new List<TNode>(); }
+
+        public static TNode ParseTags(byte[] d)
+        {
+            TNode root = new TNode(); root.Tag = -1;
+            List<TNode> st = new List<TNode>(); st.Add(root);
+            int i = 0, n = d.Length;
+            while (i < n)
+            {
+                if (d[i] == 0xFE && i + 2 < n)
+                {
+                    int t = (d[i + 1] << 8) | d[i + 2];
+                    if (t == 0x0005 && i + 7 <= n)
+                    {
+                        int L = (int)U32(d, i + 3);
+                        if (L < 0 || i + 7 + L > n) L = Math.Max(0, n - i - 7);
+                        TNode b = new TNode(); b.Tag = 5;
+                        for (int k = 0; k < L; k++) b.Data.Add(d[i + 7 + k]);
+                        st[st.Count - 1].Kids.Add(b);
+                        i += 7 + L;
+                        if (i + 3 <= n && d[i] == 0xFE && d[i + 1] == 0xFF && d[i + 2] == 0xFA) i += 3;
+                        continue;
+                    }
+                    int inv = (~t) & 0xFFFF;
+                    if (st.Count > 1 && st[st.Count - 1].Tag == inv) { st.RemoveAt(st.Count - 1); i += 3; continue; }
+                    int found = -1;
+                    for (int k = st.Count - 1; k > 0; k--) if (st[k].Tag == inv) { found = k; break; }
+                    if (found > 0 && t >= 0x8000) { st.RemoveRange(found, st.Count - found); i += 3; continue; }
+                    TNode nd = new TNode(); nd.Tag = t;
+                    st[st.Count - 1].Kids.Add(nd); st.Add(nd); i += 3; continue;
+                }
+                st[st.Count - 1].Data.Add(d[i]); i++;
+            }
+            return root;
+        }
+
+        static void JsonNode(TNode nd, StringBuilder sb)
+        {
+            sb.Append('[').Append(nd.Tag).Append(",\"");
+            foreach (byte b in nd.Data) sb.Append(b.ToString("x2"));
+            sb.Append('"');
+            if (nd.Kids.Count > 0)
+            {
+                sb.Append(",[");
+                for (int k = 0; k < nd.Kids.Count; k++) { if (k > 0) sb.Append(','); JsonNode(nd.Kids[k], sb); }
+                sb.Append(']');
+            }
+            sb.Append(']');
+        }
+
+        // Returns "tree":...,"stage":... JSON fragments for the scene, or null
+        public static string SceneTreeJson(VdbInfo info)
+        {
+            byte[] d = ReadSectionPayload(info, "Data");
+            if (d == null) return null;
+            TNode r = ParseTags(d);
+            if (r.Kids.Count == 0) return null;
+            TNode top = r.Kids[0], tree = null, stage = null;
+            foreach (TNode k in top.Kids) { if (k.Tag == 0x07c0 && tree == null) tree = k; if (k.Tag == 0x0740 && stage == null) stage = k; }
+            if (tree == null) return null;
+            StringBuilder sb = new StringBuilder();
+            sb.Append("\"tree\":"); JsonNode(tree, sb);
+            sb.Append(",\"stage\":"); if (stage != null) JsonNode(stage, sb); else sb.Append("null");
+            return sb.ToString();
+        }
+
+        // Heuristic: GH objects mentioned (as raw 16-byte UUIDs) near the scene's UUID in a GH table
+        public static List<string> FindReferences(string table, string sceneUuid, HashSet<string> known, int window)
+        {
+            List<string> res = new List<string>();
+            if (!File.Exists(table)) return res;
+            byte[] d;
+            using (FileStream fs = OpenRead(table)) d = ReadAt(fs, 0, (int)Math.Min(fs.Length, 536870912));
+            byte[] u = new byte[16];
+            for (int k = 0; k < 16; k++) u[k] = Convert.ToByte(sceneUuid.Substring(k * 2, 2), 16);
+            for (int i = 0; i + 16 <= d.Length; i++)
+            {
+                bool hit = true;
+                for (int k = 0; k < 16; k++) if (d[i + k] != u[k]) { hit = false; break; }
+                if (!hit) continue;
+                int a = Math.Max(0, i - window), b = Math.Min(d.Length - 16, i + window);
+                for (int j = a; j <= b; j++)
+                {
+                    if (j == i) continue;
+                    StringBuilder sb = new StringBuilder(32);
+                    for (int k = 0; k < 16; k++) sb.Append(d[j + k].ToString("X2"));
+                    string s = sb.ToString();
+                    if (known.Contains(s) && s != sceneUuid && !res.Contains(s)) res.Add(s);
+                }
+            }
+            return res;
+        }
+
+        // ---- Viz scripts stored in a scene: Script plugins (0700 > 0704 > 0704 > 0702 code) ----
+        static string TagText(TNode n)
+        {
+            if (n == null || n.Data.Count < 2) return "";
+            int L = n.Data[0] | (n.Data[1] << 8);
+            int len = Math.Min(L, n.Data.Count - 2);
+            return Encoding.UTF8.GetString(n.Data.GetRange(2, len).ToArray());
+        }
+
+        static void WalkScripts(TNode n, string owner, List<string[]> res)
+        {
+            if (n.Tag == 0x0300)
+                foreach (TNode k in n.Kids) if (k.Tag == 0x0317) { owner = TagText(k); break; }
+            if (n.Tag == 0x0702)
+            {
+                string code = TagText(n);
+                if (code.Trim().Length > 0) res.Add(new string[] { owner ?? "(scene)", code });
+            }
+            foreach (TNode k in n.Kids) WalkScripts(k, owner, res);
+        }
+
+        public static List<string[]> SceneScripts(VdbInfo info)
+        {
+            List<string[]> res = new List<string[]>();
+            byte[] d = ReadSectionPayload(info, "Data");
+            if (d == null) return res;
+            WalkScripts(ParseTags(d), null, res);
+            return res;
+        }
+
+        // ---- ReferenceCollection.vdb.dat: one record per object
+        //      [16-byte object UUID][u32 n][n folder UUIDs][u32 n][n "used by" UUIDs][u32 n][n "uses" UUIDs]
+        public class RefTable
+        {
+            public Dictionary<string, List<string>> Uses = new Dictionary<string, List<string>>();
+            public Dictionary<string, List<string>> UsedBy = new Dictionary<string, List<string>>();
+            public Dictionary<string, List<string>> Folders = new Dictionary<string, List<string>>();
+            public int Records, Skipped;
+        }
+
+        static List<string> RefList(byte[] d, ref int q, int max)
+        {
+            if (q + 4 > d.Length) return null;
+            uint n = U32(d, q); q += 4;
+            if (n > max || q + 16L * n > d.Length) return null;
+            List<string> r = new List<string>((int)n);
+            StringBuilder sb = new StringBuilder(32);
+            for (int k = 0; k < n; k++)
+            {
+                sb.Length = 0;
+                for (int j = 0; j < 16; j++) sb.Append(d[q + j].ToString("X2"));
+                r.Add(sb.ToString()); q += 16;
+            }
+            return r;
+        }
+
+        public static RefTable ReadRefs(string path, HashSet<string> known)
+        {
+            RefTable t = new RefTable();
+            byte[] d;
+            using (FileStream fs = OpenRead(path)) d = ReadAt(fs, 0, (int)Math.Min(fs.Length, 1073741824));
+            int p = 0;
+            StringBuilder sb = new StringBuilder(32);
+            while (p + 28 <= d.Length)
+            {
+                sb.Length = 0;
+                for (int j = 0; j < 16; j++) sb.Append(d[p + j].ToString("X2"));
+                string key = sb.ToString();
+                int q = p + 16;
+                List<string> f = RefList(d, ref q, 64), a = f == null ? null : RefList(d, ref q, 100000), u = a == null ? null : RefList(d, ref q, 100000);
+                bool ok = f != null && a != null && u != null && f.Count >= 1;
+                if (ok && known != null && known.Count > 0)
+                {
+                    if (!known.Contains(key)) { foreach (string x in a) if (!known.Contains(x)) { ok = false; break; } if (ok) foreach (string x in u) if (!known.Contains(x)) { ok = false; break; } if (a.Count + u.Count == 0) ok = false; }
+                }
+                if (!ok) { p += 4; t.Skipped += 4; continue; }
+                t.Folders[key] = f; t.UsedBy[key] = a; t.Uses[key] = u; t.Records++;
+                p = q;
+            }
+            return t;
         }
 
         public static byte[] ReadPayload(VdbInfo info)
@@ -349,8 +777,7 @@ namespace GhTool
             {
                 foreach (Chunk c in info.Chunks)
                 {
-                    byte[] comp = ReadAt(fs, c.Offset, c.CompLen);
-                    byte[] raw = Inflate(comp, 10, c.CompLen - 10, c.RawLen);
+                    byte[] raw = ReadChunk(fs, c);
                     if (raw == null) throw new InvalidDataException("Unreadable chunk at offset " + c.Offset);
                     all.Write(raw, 0, raw.Length);
                 }
@@ -361,6 +788,7 @@ namespace GhTool
         public static byte[] ReadThumb(VdbInfo info, int index)
         {
             Thumb t = info.Thumbs[index];
+            if (t.Bytes != null) return t.Bytes;
             using (FileStream fs = OpenRead(info.Path)) return ReadAt(fs, t.Offset, t.Length);
         }
 
@@ -701,25 +1129,221 @@ namespace GhTool
             return o.ToArray();
         }
 
-        // ---- thumbnail section: template [43-byte prefix][JPEG][17-byte suffix] ----
-        public static byte[] RebuildIconSection(byte[] sec, byte[] jpeg, int w, int h)
+        // ---- helpers for multi-section (newer) files ----
+        public static byte[] DecodeSection(byte[] sec)
         {
-            int J = sec.Length - 60;
-            if (J <= 0 || sec[43] != 0xFF || sec[44] != 0xD8) return null;
-            if (U32(sec, 14) != J + 32 || U32(sec, 18) != J + 24 || U32(sec, 28) != J || U32(sec, 39) != J) return null;
-            if (sec[22] != 4 || Encoding.ASCII.GetString(sec, 24, 4) != "JPEG") return null;
-            int N = jpeg.Length;
-            byte[] r = new byte[N + 60];
-            Buffer.BlockCopy(sec, 0, r, 0, 43);
-            P32(r, 14, (uint)(N + 32)); P32(r, 18, (uint)(N + 24)); P32(r, 28, (uint)N); P32(r, 39, (uint)N);
-            r[32] = (byte)w; r[33] = (byte)(w >> 8); r[34] = (byte)h; r[35] = (byte)(h >> 8);
-            Buffer.BlockCopy(jpeg, 0, r, 43, N);
-            Buffer.BlockCopy(sec, 43 + J, r, 43 + N, 17);
-            return r;
+            MemoryStream o = new MemoryStream();
+            int p = 0;
+            while (p + 8 <= sec.Length)
+            {
+                int c = (int)U32(sec, p), r = (int)U32(sec, p + 4);
+                if (c < 9 || p + c > sec.Length) throw new InvalidDataException("Bad chunk in section.");
+                if (c - 8 == r) o.Write(sec, p + 8, r);
+                else
+                {
+                    using (MemoryStream ms = new MemoryStream(sec, p + 10, c - 10))
+                    using (DeflateStream ds = new DeflateStream(ms, CompressionMode.Decompress))
+                    {
+                        byte[] buf = new byte[r]; int t = 0;
+                        while (t < r) { int n = ds.Read(buf, t, r - t); if (n <= 0) break; t += n; }
+                        if (t != r) throw new InvalidDataException("Bad zlib chunk in section.");
+                        o.Write(buf, 0, r);
+                    }
+                }
+                p += c;
+            }
+            if (p != sec.Length) throw new InvalidDataException("Section does not end on a chunk boundary.");
+            return o.ToArray();
         }
 
-        public static int IconWidth(byte[] sec) { return sec.Length > 36 ? sec[32] | (sec[33] << 8) : 0; }
-        public static int IconHeight(byte[] sec) { return sec.Length > 36 ? sec[34] | (sec[35] << 8) : 0; }
+        public static int FirstRawChunk(byte[] sec) { return sec.Length >= 8 ? (int)U32(sec, 4) : 0; }
+
+        public static VdbInfo ParsePixels(byte[] payload)
+        {
+            VdbInfo t = new VdbInfo();
+            Vdb.ParsePayloadHeaderPublic(payload, t);
+            return t;
+        }
+
+        // Mip level payload: FE 0B 61 FE 0B 63 [u32 w][u32 h] ... FE 00 05 [u32 len] <BC1 blocks>
+        public static int[] FindMip(byte[] pl)
+        {
+            if (pl.Length < 40 || pl[0] != 0xFE || pl[1] != 0x0B || pl[2] != 0x61 || pl[3] != 0xFE || pl[4] != 0x0B || pl[5] != 0x63) return null;
+            int w = (int)U32(pl, 6), h = (int)U32(pl, 10);
+            for (int i = 14; i + 7 <= Math.Min(pl.Length, 64); i++)
+            {
+                if (pl[i] == 0xFE && pl[i + 1] == 0x00 && pl[i + 2] == 0x05)
+                {
+                    int len = (int)U32(pl, i + 3);
+                    if (i + 7 + (long)len > pl.Length) return null;
+                    return new int[] { w, h, i + 7, len };
+                }
+            }
+            return null;
+        }
+
+        // BC1 (DXT1) encoder, opaque 4-colour mode; flip = rows stored bottom-up
+        public static void EncodeBC1(byte[] rgba, int w, int h, bool flip, byte[] dst, int off)
+        {
+            int bw = (w + 3) / 4, bh = (h + 3) / 4;
+            int[] r = new int[16], g = new int[16], b = new int[16];
+            int p = off;
+            for (int by = 0; by < bh; by++)
+                for (int bx = 0; bx < bw; bx++)
+                {
+                    int minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0;
+                    for (int j = 0; j < 16; j++)
+                    {
+                        int x = Math.Min(w - 1, bx * 4 + (j & 3)), y = Math.Min(h - 1, by * 4 + (j >> 2));
+                        int sy = flip ? h - 1 - y : y;
+                        int s = (sy * w + x) * 4;
+                        r[j] = rgba[s]; g[j] = rgba[s + 1]; b[j] = rgba[s + 2];
+                        if (r[j] < minR) minR = r[j]; if (g[j] < minG) minG = g[j]; if (b[j] < minB) minB = b[j];
+                        if (r[j] > maxR) maxR = r[j]; if (g[j] > maxG) maxG = g[j]; if (b[j] > maxB) maxB = b[j];
+                    }
+                    // inset the bounding box slightly, then pick the diagonal that follows the colour covariance
+                    int iR = (maxR - minR) >> 4, iG = (maxG - minG) >> 4, iB = (maxB - minB) >> 4;
+                    minR += iR; minG += iG; minB += iB; maxR -= iR; maxG -= iG; maxB -= iB;
+                    double mr = 0, mg = 0, mb = 0; for (int j = 0; j < 16; j++) { mr += r[j]; mg += g[j]; mb += b[j]; }
+                    mr /= 16; mg /= 16; mb /= 16;
+                    double crg = 0, cbg = 0; for (int j = 0; j < 16; j++) { crg += (r[j] - mr) * (g[j] - mg); cbg += (b[j] - mb) * (g[j] - mg); }
+                    int r0 = maxR, g0 = maxG, b0 = maxB, r1 = minR, g1 = minG, b1 = minB;
+                    if (crg < 0) { int t = r0; r0 = r1; r1 = t; }
+                    if (cbg < 0) { int t = b0; b0 = b1; b1 = t; }
+                    int c0 = ((r0 >> 3) << 11) | ((g0 >> 2) << 5) | (b0 >> 3);
+                    int c1 = ((r1 >> 3) << 11) | ((g1 >> 2) << 5) | (b1 >> 3);
+                    uint idx = 0;
+                    if (c0 == c1)
+                    {
+                        if (c0 == 0xFFFF) c1 = 0xFFFE; else c0 = c0 + 1;   // keep 4-colour mode (c0 > c1)
+                    }
+                    if (c0 < c1) { int t = c0; c0 = c1; c1 = t; }
+                    int[] pr = new int[4], pg = new int[4], pb = new int[4];
+                    pr[0] = ((c0 >> 11) & 31) * 255 / 31; pg[0] = ((c0 >> 5) & 63) * 255 / 63; pb[0] = (c0 & 31) * 255 / 31;
+                    pr[1] = ((c1 >> 11) & 31) * 255 / 31; pg[1] = ((c1 >> 5) & 63) * 255 / 63; pb[1] = (c1 & 31) * 255 / 31;
+                    pr[2] = (2 * pr[0] + pr[1]) / 3; pg[2] = (2 * pg[0] + pg[1]) / 3; pb[2] = (2 * pb[0] + pb[1]) / 3;
+                    pr[3] = (pr[0] + 2 * pr[1]) / 3; pg[3] = (pg[0] + 2 * pg[1]) / 3; pb[3] = (pb[0] + 2 * pb[1]) / 3;
+                    for (int j = 0; j < 16; j++)
+                    {
+                        int bi = 0, bd = int.MaxValue;
+                        for (int k = 0; k < 4; k++)
+                        {
+                            int dr = r[j] - pr[k], dg = g[j] - pg[k], db = b[j] - pb[k];
+                            int dd = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+                            if (dd < bd) { bd = dd; bi = k; }
+                        }
+                        idx |= (uint)bi << (2 * j);
+                    }
+                    dst[p] = (byte)c0; dst[p + 1] = (byte)(c0 >> 8); dst[p + 2] = (byte)c1; dst[p + 3] = (byte)(c1 >> 8);
+                    dst[p + 4] = (byte)idx; dst[p + 5] = (byte)(idx >> 8); dst[p + 6] = (byte)(idx >> 16); dst[p + 7] = (byte)(idx >> 24);
+                    p += 8;
+                }
+        }
+
+        public static byte[] DecodeBC1(byte[] src, int off, int w, int h, bool flip)
+        {
+            byte[] o = new byte[w * h * 4];
+            int bw = (w + 3) / 4, bh = (h + 3) / 4, p = off;
+            int[] pr = new int[4], pg = new int[4], pb = new int[4];
+            for (int by = 0; by < bh; by++)
+                for (int bx = 0; bx < bw; bx++)
+                {
+                    int c0 = src[p] | (src[p + 1] << 8), c1 = src[p + 2] | (src[p + 3] << 8);
+                    uint idx = U32(src, p + 4); p += 8;
+                    pr[0] = ((c0 >> 11) & 31) * 255 / 31; pg[0] = ((c0 >> 5) & 63) * 255 / 63; pb[0] = (c0 & 31) * 255 / 31;
+                    pr[1] = ((c1 >> 11) & 31) * 255 / 31; pg[1] = ((c1 >> 5) & 63) * 255 / 63; pb[1] = (c1 & 31) * 255 / 31;
+                    if (c0 > c1) { pr[2] = (2 * pr[0] + pr[1]) / 3; pg[2] = (2 * pg[0] + pg[1]) / 3; pb[2] = (2 * pb[0] + pb[1]) / 3; pr[3] = (pr[0] + 2 * pr[1]) / 3; pg[3] = (pg[0] + 2 * pg[1]) / 3; pb[3] = (pb[0] + 2 * pb[1]) / 3; }
+                    else { pr[2] = (pr[0] + pr[1]) / 2; pg[2] = (pg[0] + pg[1]) / 2; pb[2] = (pb[0] + pb[1]) / 2; pr[3] = pg[3] = pb[3] = 0; }
+                    for (int j = 0; j < 16; j++)
+                    {
+                        int x = bx * 4 + (j & 3), y = by * 4 + (j >> 2);
+                        if (x >= w || y >= h) continue;
+                        int sy = flip ? h - 1 - y : y, k = (int)((idx >> (2 * j)) & 3), d = (sy * w + x) * 4;
+                        o[d] = (byte)pr[k]; o[d + 1] = (byte)pg[k]; o[d + 2] = (byte)pb[k]; o[d + 3] = 255;
+                    }
+                }
+            return o;
+        }
+
+        public static byte[] BuildDataSectionLevel(byte[] payload, int rawChunk, bool fast)
+        {
+            MemoryStream o = new MemoryStream();
+            for (int p = 0; p < payload.Length; p += rawChunk)
+            {
+                int n = Math.Min(rawChunk, payload.Length - p);
+                byte[] z = ZlibLevel(payload, p, n, fast);
+                if (z.Length >= n) { W32(o, (uint)(n + 8)); W32(o, (uint)n); o.Write(payload, p, n); }   // store when it does not compress
+                else { W32(o, (uint)(z.Length + 8)); W32(o, (uint)n); o.Write(z, 0, z.Length); }
+            }
+            return o.ToArray();
+        }
+
+        static byte[] ZlibLevel(byte[] raw, int off, int len, bool fast)
+        {
+            uint s1 = 1, s2 = 0;
+            for (int i = off; i < off + len; i++) { s1 = (s1 + raw[i]) % 65521; s2 = (s2 + s1) % 65521; }
+            using (MemoryStream z = new MemoryStream())
+            {
+                z.WriteByte(0x78); z.WriteByte(0x01);
+                using (DeflateStream ds = new DeflateStream(z, fast ? CompressionLevel.Fastest : CompressionLevel.Optimal, true)) ds.Write(raw, off, len);
+                uint a = (s2 << 16) | s1;
+                z.WriteByte((byte)(a >> 24)); z.WriteByte((byte)(a >> 16)); z.WriteByte((byte)(a >> 8)); z.WriteByte((byte)a);
+                return z.ToArray();
+            }
+        }
+
+        // ---- thumbnail sections are chunk streams; the JPEG block is
+        //      04 00 "JPEG" [u32 J][u16 w][u16 h] FE 00 05 [u32 J] <JPEG> FE FF FA
+        //      stored in its own chunk(s) of at most 51192 bytes ----
+        static int IconMarker(byte[] pl)
+        {
+            for (int k = 0; k + 21 < pl.Length && k < 96; k++)
+                if (pl[k] == 4 && pl[k + 1] == 0 && pl[k + 2] == 0x4A && pl[k + 3] == 0x50 && pl[k + 4] == 0x45 && pl[k + 5] == 0x47) return k;
+            return -1;
+        }
+
+        public static byte[] RebuildIconSection(byte[] sec, byte[] jpeg, int w, int h)
+        {
+            byte[] pl;
+            try { pl = DecodeSection(sec); } catch { return null; }
+            int k = IconMarker(pl);
+            if (k < 0) return null;
+            int J = (int)U32(pl, k + 6);
+            if (U32(pl, k + 17) != J || pl[k + 14] != 0xFE || pl[k + 15] != 0x00 || pl[k + 16] != 0x05) return null;
+            int blockEnd = k + 21 + J + 3;
+            if (blockEnd > pl.Length || pl[blockEnd - 3] != 0xFE || pl[blockEnd - 2] != 0xFF || pl[blockEnd - 1] != 0xFA) return null;
+            // chunk boundaries in the section (file bytes) and in the payload (raw bytes)
+            int p = 0; long raw = 0; int cutA = -1, cutB = -1;
+            while (p + 8 <= sec.Length)
+            {
+                if (raw == k) cutA = p;
+                if (raw == blockEnd) cutB = p;
+                int c = (int)U32(sec, p), r = (int)U32(sec, p + 4);
+                p += c; raw += r;
+            }
+            if (raw == blockEnd) cutB = p;
+            if (cutA < 0 || cutB < 0) return null;
+            int N = jpeg.Length;
+            byte[] blk = new byte[21 + N + 3];
+            Buffer.BlockCopy(pl, k, blk, 0, 6);
+            P32(blk, 6, (uint)N); blk[10] = (byte)w; blk[11] = (byte)(w >> 8); blk[12] = (byte)h; blk[13] = (byte)(h >> 8);
+            blk[14] = 0xFE; blk[15] = 0x00; blk[16] = 0x05; P32(blk, 17, (uint)N);
+            Buffer.BlockCopy(jpeg, 0, blk, 21, N);
+            blk[21 + N] = 0xFE; blk[22 + N] = 0xFF; blk[23 + N] = 0xFA;
+            MemoryStream o = new MemoryStream();
+            o.Write(sec, 0, cutA);
+            for (int q = 0; q < blk.Length; q += 51192)
+            {
+                int n = Math.Min(51192, blk.Length - q);
+                W32(o, (uint)(n + 8)); W32(o, (uint)n); o.Write(blk, q, n);
+            }
+            o.Write(sec, cutB, sec.Length - cutB);
+            return o.ToArray();
+        }
+
+        public static int IconWidth(byte[] sec) { try { byte[] pl = DecodeSection(sec); int k = IconMarker(pl); return k < 0 ? 0 : pl[k + 10] | (pl[k + 11] << 8); } catch { return 0; } }
+        public static int IconHeight(byte[] sec) { try { byte[] pl = DecodeSection(sec); int k = IconMarker(pl); return k < 0 ? 0 : pl[k + 12] | (pl[k + 13] << 8); } catch { return 0; } }
+        public static byte[] IconJpeg(byte[] sec) { try { byte[] pl = DecodeSection(sec); int k = IconMarker(pl); if (k < 0) return null; int J = (int)U32(pl, k + 6); byte[] r = new byte[J]; Buffer.BlockCopy(pl, k + 21, r, 0, J); return r; } catch { return null; } }
 
         // ---- PNG decoding (non-interlaced) -> RGBA ----
         public static byte[] DecodePng(byte[] f, out int w, out int h)
@@ -1215,6 +1839,35 @@ function Resolve-GhObject([string]$Id) {
     throw "No object matches '$Id'."
 }
 
+
+# ---------------------------------------------------------------------------
+#  References between objects (ReferenceCollection.vdb.dat)
+# ---------------------------------------------------------------------------
+$script:Refs = $null; $script:RefsRoot = $null
+function Get-GhRefs {
+    $root = Get-GhRoot
+    if ($script:Refs -and $script:RefsRoot -eq $root) { return $script:Refs }
+    $tbl = @(Get-ChildItem -LiteralPath $root -File -Filter 'ReferenceCollection*.dat' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Ext' } | Sort-Object Length -Descending)
+    if (-not $tbl.Count) { return $null }
+    $known = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($f in (Get-GhVdbFiles $root)) { [void]$known.Add($f.BaseName.ToUpperInvariant()) }
+    $script:Refs = [GhTool.Vdb]::ReadRefs($tbl[0].FullName, $known); $script:RefsRoot = $root
+    return $script:Refs
+}
+function Get-GhRefList([string]$uuid, [string]$which) {
+    $r = Get-GhRefs; if (-not $r) { return @() }
+    $d = if ($which -eq 'uses') { $r.Uses } else { $r.UsedBy }
+    $l = $null
+    if ($d.TryGetValue($uuid.ToUpperInvariant(), [ref]$l)) { return @($l) }
+    return @()
+}
+function Get-GhObjectLabel([string]$uuid) {
+    $p = Join-Path (Join-Path (Get-GhRoot) $uuid.Substring(0, 1)) "$uuid.vdb"
+    if (-not (Test-Path -LiteralPath $p)) { return [pscustomobject]@{ Uuid = $uuid; Name = '(missing)'; Kind = '?'; Path = $null } }
+    $i = [GhTool.Vdb]::Inspect($p)
+    return [pscustomobject]@{ Uuid = $uuid; Name = $i.Name; Kind = $i.Kind; Path = $p }
+}
+
 # ---------------------------------------------------------------------------
 #  Commands
 # ---------------------------------------------------------------------------
@@ -1349,7 +2002,7 @@ function Invoke-GhDeep {
 }
 
 function Format-GhLine($r) {
-    $dim = if ($r.Kind -eq 'Image') { "$($r.Width)×$($r.Height) $($r.PixelFormat)" } else { $r.Sections }
+    $dim = if ($r.Kind -eq 'Image') { "$($r.Width)×$($r.Height) $($r.PixelFormat)" } elseif ($r.Kind -in 'Scene', 'Material') { '' } else { $r.Sections }
     $date = if ($r.Created) { $r.Created.Substring(0, 10) } else { '' }
     $nm = if ($r.Name) { $r.Name } else { '(no name)' }
     return ('{0}  [{1}]  {2}  {3}  {4}' -f $nm, $r.Uuid.Substring(0, 8), $dim, (Format-Size $r.Size), $date)
@@ -1451,8 +2104,10 @@ function Invoke-GhShow($a) {
         'Created (UTC)' = $(if ($null -ne $i.Created) { ([datetime]$i.Created).ToString('yyyy-MM-dd HH:mm:ss') })
         'Modified (UTC)' = $(if ($null -ne $i.Modified) { ([datetime]$i.Modified).ToString('yyyy-MM-dd HH:mm:ss') })
         'Sections' = $i.Sections
-        'Thumbnails' = (($i.Thumbs | ForEach-Object { "$($_.Width)×$($_.Height) JPEG ($($_.Length) B @ $($_.Offset))" }) -join '; ')
+        'Thumbnails' = (($i.Thumbs | ForEach-Object { "$(if ($_.Name) { "$($_.Name) " })$($_.Width)×$($_.Height) JPEG ($($_.Length) B)" }) -join '; ')
         'zlib chunks' = $i.ChunkCount
+        'Pixel source' = $(if ($i.PixelSection) { "section $($i.PixelSection)" + $(if ($i.PreviewSize) { " (Data holds a $($i.PreviewSize) preview)" } else { '' }) } else { '' })
+        'Mipmap levels' = $(if ($i.MipLevels) { "$($i.MipLevels) (DXT1/BC1)" } else { '' })
         'Image' = $(if ($i.Kind -eq 'Image') { "$($i.Width)×$($i.Height), $($i.PixelFormat) (GL 0x$('{0:X4}' -f $i.GlFormat)), $($i.Channels) channels, $(Format-Size $i.PixelLength) of pixels" } else { '' })
         'Application' = $(if ($i.AppName) { "$($i.AppName) $($i.AppVersion)" } else { '' })
         'DB engine' = $i.DbVersion
@@ -1460,6 +2115,24 @@ function Invoke-GhShow($a) {
         'Error' = $i.Error
     }
     foreach ($k in $rows.Keys) { if ("$($rows[$k])" -ne '') { Write-Gh ("  {0,-20} {1}" -f $k, $rows[$k]) } }
+    if ($i.TypeCode) { Write-Gh ("  {0,-20} 0x{1:X4}" -f 'Object type code', $i.TypeCode) }
+    $uses = @(Get-GhRefList $i.Uuid 'uses'); $usedBy = @(Get-GhRefList $i.Uuid 'usedby')
+    if ($uses.Count) { Write-Gh ''; Write-Gh "  Uses ($($uses.Count)):" White; foreach ($u in $uses) { $o = Get-GhObjectLabel $u; Write-Gh ("    {0,-9} {1}  [{2}]" -f $o.Kind, $o.Name, $u.Substring(0, 8)) } }
+    if ($usedBy.Count) { Write-Gh ''; Write-Gh "  Used by ($($usedBy.Count)):" White; foreach ($u in $usedBy) { $o = Get-GhObjectLabel $u; Write-Gh ("    {0,-9} {1}  [{2}]" -f $o.Kind, $o.Name, $u.Substring(0, 8)) } }
+    if ($i.Kind -ne 'Image' -and $i.SectionList) {
+        $sc = [GhTool.Vdb]::Scene($i)
+        $max = if ($a.Opt.all) { [int]::MaxValue } else { 40 }
+        if ($sc.Containers.Count) {
+            Write-Gh ''
+            Write-Gh "  Containers ($($sc.Containers.Count), in file order):" White
+            $sc.Containers | Select-Object -First $max | ForEach-Object { Write-Gh "    $_" }
+            if ($sc.Containers.Count -gt $max) { Write-Gh "    ... ($($sc.Containers.Count - $max) more, use -All)" DarkGray }
+        }
+        if ($sc.Plugins.Count) { Write-Gh ''; Write-Gh '  Plugins:' White; Write-Gh ("    " + ($sc.Plugins -join ', ')) }
+        if ($sc.Directors.Count) { Write-Gh ''; Write-Gh '  Directors:' White; Write-Gh ("    " + ($sc.Directors -join ', ')) }
+        if ($sc.ControlFields.Count) { Write-Gh ''; Write-Gh '  Control object fields (name (label)):' White; $sc.ControlFields | ForEach-Object { Write-Gh "    $_" } }
+        if ($i.Kind -eq 'Scene') { Write-Gh ''; Write-Gh '  (Names are read from the scene data; the scene format is not documented, so the hierarchy is not shown.)' DarkGray }
+    }
 }
 
 function Assert-GhOutside([string]$out) {
@@ -1491,7 +2164,7 @@ function Export-GhObject([string]$path, [string]$out, $a) {
         [IO.File]::WriteAllBytes("$base.data.bin", $payload); $done.Add("$base.data.bin")
     }
     if ($a.Opt.raw -and $payload -and $i.Kind -eq 'Image') { [IO.File]::WriteAllBytes("$base.data.bin", $payload); $done.Add("$base.data.bin") }
-    if ($a.Opt.thumbs -or -not $payload) {
+    if ($a.Opt.thumbs -or -not $payload -or $i.Kind -ne 'Image') {
         for ($t = 0; $t -lt $i.ThumbCount; $t++) {
             $tp = "$base.thumb$t.jpg"; [IO.File]::WriteAllBytes($tp, [GhTool.Vdb]::ReadThumb($i, $t)); $done.Add($tp)
         }
@@ -1709,7 +2382,30 @@ function Invoke-GhGallery($a) {
             $full = Join-Path $fullDir "$($r.Uuid).png"
             $useFast = $a.Opt.fast -or $r.Kind -ne 'Image'
             $needFull = $a.Opt.full -and $r.Kind -eq 'Image' -and ($a.Opt.refresh -or -not (Test-Path -LiteralPath $full))
-            if (-not $useFast) {
+            if (-not $useFast -and -not $needFull -and -not (Test-Path -LiteralPath $png)) {
+                # Newer files carry a large JPEG preview (IconLarge): use it when it is big enough
+                $ljpg = Join-Path $thumbDir "$($r.Uuid)_e$size.jpg"
+                if (-not $a.Opt.refresh -and (Test-Path -LiteralPath $ljpg)) { $reused++; $useFast = $true }
+                else {
+                    $i = [GhTool.Vdb]::Inspect($r.Path)
+                    $best = -1; for ($t = 0; $t -lt $i.ThumbCount; $t++) { if ($best -lt 0 -or $i.Thumbs[$t].Width -gt $i.Thumbs[$best].Width) { $best = $t } }
+                    if ($best -ge 0 -and [Math]::Max($i.Thumbs[$best].Width, $i.Thumbs[$best].Height) -ge $size) {
+                        [IO.File]::WriteAllBytes($ljpg, [GhTool.Vdb]::ReadThumb($i, $best)); $made++; $useFast = $true
+                    }
+                }
+                if ($useFast) { $thumbRel = "thumbs/$($r.Uuid)_e$size.jpg" }
+            }
+            if ($useFast) {
+                if ($thumbRel) { }
+                elseif ([int]$r.Thumbs -gt 0) {
+                    if ($a.Opt.refresh -or -not (Test-Path -LiteralPath $jpg)) {
+                        $i = [GhTool.Vdb]::Inspect($r.Path)
+                        $best = 0; for ($t = 1; $t -lt $i.ThumbCount; $t++) { if ($i.Thumbs[$t].Width -gt $i.Thumbs[$best].Width) { $best = $t } }
+                        [IO.File]::WriteAllBytes($jpg, [GhTool.Vdb]::ReadThumb($i, $best)); $made++
+                    } else { $reused++ }
+                    $thumbRel = "thumbs/$($r.Uuid).jpg"
+                }
+            } else {
                 if ($a.Opt.refresh -or -not (Test-Path -LiteralPath $png) -or $needFull) {
                     $i = [GhTool.Vdb]::Inspect($r.Path)
                     $payload = [GhTool.Vdb]::ReadPayload($i)
@@ -1718,13 +2414,6 @@ function Invoke-GhGallery($a) {
                     $payload = $null
                 } else { $reused++ }
                 $thumbRel = "thumbs/$($r.Uuid)_$size.png"
-            } elseif ([int]$r.Thumbs -gt 0) {
-                if ($a.Opt.refresh -or -not (Test-Path -LiteralPath $jpg)) {
-                    $i = [GhTool.Vdb]::Inspect($r.Path)
-                    $best = 0; for ($t = 1; $t -lt $i.ThumbCount; $t++) { if ($i.Thumbs[$t].Width -gt $i.Thumbs[$best].Width) { $best = $t } }
-                    [IO.File]::WriteAllBytes($jpg, [GhTool.Vdb]::ReadThumb($i, $best)); $made++
-                } else { $reused++ }
-                $thumbRel = "thumbs/$($r.Uuid).jpg"
             }
             if ($a.Opt.full -and (Test-Path -LiteralPath $full)) { $fullRel = "full/$($r.Uuid).png" }
         } catch { $errs++; $err = $_.Exception.Message }
@@ -2014,48 +2703,92 @@ function Write-GhFileAtomic([string]$target, [byte[]]$bytes, [bool]$keepTime) {
 function New-GhReplacement([string]$path, [string]$imagePath, $a) {
     $info = [GhTool.Vdb]::Inspect($path)
     if ($info.Kind -ne 'Image') { throw "Object $($info.Uuid) is not an image ($($info.Kind))." }
-    if ($info.Sections -ne 'IconSmall,Icon,Data,Original,VERSION') { throw "Unrecognised section structure ($($info.Sections)): replacement refused." }
+    if (-not $info.SectionList) { throw "Section table not readable: replacement refused." }
+    foreach ($sn in ($info.Sections -split ',')) {
+        if ($sn -notmatch '^(IconSmall|Icon|IconLarge|Data|Original|VERSION|MMLevel\.\d+)$') { throw "Unrecognised section '$sn': replacement refused." }
+    }
     if ($info.Channels -lt 1 -or $info.Channels -gt 4) { throw "Unsupported pixel format: $($info.PixelFormat)" }
 
     $orig = [IO.File]::ReadAllBytes($path)
     try { $layout = [GhTool.VdbWriter]::Parse($orig) } catch { throw "Unrecognised internal structure ($($_.Exception.Message)): replacement refused." }
     if (-not [GhTool.VdbWriter]::SameBytes($orig, [GhTool.VdbWriter]::Build($layout))) { throw "Identical rebuild failed: unknown format variant, replacement refused." }
-
-    $names = $info.Sections -split ','
-    $iData = [array]::IndexOf($names, 'Data'); $iS = [array]::IndexOf($names, 'IconSmall'); $iI = [array]::IndexOf($names, 'Icon')
-    $chunkTotal = [long]0; foreach ($c in $info.Chunks) { $chunkTotal += $c.CompLen }
-    if ($layout.Sections[$iData].Length -ne $chunkTotal) { throw "The Data section does not match the compressed chunks: replacement refused." }
-
-    $payload = [GhTool.Vdb]::ReadPayload($info)
-    $after = $payload.Length - ($info.PixelOffset + $info.PixelLength)
-    if ($after -lt 0 -or $after -gt 2048) { throw "Extra data after the pixels ($after B): possible mipmap levels, replacement refused." }
-    $w = $info.Width; $h = $info.Height; $ch = $info.Channels
-    $stride = if ($info.PixelLength % $h -eq 0 -and $info.PixelLength / $h -ge $w * $ch) { $info.PixelLength / $h } else { $w * $ch }
+    $secNames = @($info.SectionList | ForEach-Object { $_.Name })
+    if ($secNames.Count -ne $layout.Sections.Count) { throw "Section count mismatch: replacement refused." }
 
     $mode = if ($a.Opt.mode) { "$($a.Opt.mode)".ToLower() } else { 'fit' }
     if ($mode -notin 'fit', 'fill', 'stretch') { throw "Unknown mode: $mode (fit, fill or stretch)" }
     $hasAlpha = $info.GlFormat -in 0x1908, 0x80E1, 0x190A, 0x1906
     $bg = ConvertFrom-GhColor $(if ($a.Opt.background) { $a.Opt.background } else { '000000' })
     $bgA = if ($hasAlpha -and -not $a.Opt.background) { [byte]0 } else { [byte]255 }
+    $flip = -not $a.Opt.noflip
 
+    Write-Gh "  Reading the new image..." DarkGray
     $src = Read-GhImageFile $imagePath
-    $rgba = [GhTool.VdbWriter]::Resize($src.Rgba, $src.W, $src.H, $w, $h, $mode, $bg[0], $bg[1], $bg[2], $bgA)
 
-    $newPayload = [byte[]]$payload.Clone()
-    [GhTool.VdbWriter]::WritePixels($rgba, $w, $h, $info.GlFormat, $ch, (-not $a.Opt.noflip), $newPayload, $info.PixelOffset, [int]$stride, $bg[0], $bg[1], $bg[2])
-    $layout.Sections[$iData] = [GhTool.VdbWriter]::BuildDataSection($newPayload, $info.Chunks[0].RawLen)
+    # 1) main pixel section (Original in newer files, Data in older ones)
+    $mainIdx = [array]::IndexOf($secNames, $info.PixelSection)
+    if ($mainIdx -lt 0) { throw 'Pixel section not found: replacement refused.' }
+    $mainPl = [GhTool.VdbWriter]::DecodeSection($layout.Sections[$mainIdx])
+    $mi = [GhTool.VdbWriter]::ParsePixels($mainPl)
+    $after = $mainPl.Length - ($mi.PixelOffset + $mi.PixelLength)
+    if ($mi.Kind -ne 'Image' -or $after -lt 0 -or $after -gt 2048) { throw "Unexpected data around the pixels ($after B): replacement refused." }
+    $w = $mi.Width; $h = $mi.Height
+    Write-Gh "  Resizing to $w×$h ($mode)..." DarkGray
+    $main = [GhTool.VdbWriter]::Resize($src.Rgba, $src.W, $src.H, $w, $h, $mode, $bg[0], $bg[1], $bg[2], $bgA)
+    $src = $null
+    $results = @{}
+    $newMainPl = [byte[]]$mainPl.Clone()
+    $stride = if ($mi.PixelLength % $h -eq 0 -and $mi.PixelLength / $h -ge $w * $mi.Channels) { $mi.PixelLength / $h } else { $w * $mi.Channels }
+    [GhTool.VdbWriter]::WritePixels($main, $w, $h, $mi.GlFormat, $mi.Channels, $flip, $newMainPl, $mi.PixelOffset, [int]$stride, $bg[0], $bg[1], $bg[2])
+    $big = $newMainPl.Length -gt 16MB
+    Write-Gh "  Compressing $($info.PixelSection) ($(Format-Size $newMainPl.Length))..." DarkGray
+    $layout.Sections[$mainIdx] = [GhTool.VdbWriter]::BuildDataSectionLevel($newMainPl, [GhTool.VdbWriter]::FirstRawChunk($layout.Sections[$mainIdx]), $big)
+    $results[$info.PixelSection] = $newMainPl
+
+    $notes = New-Object System.Collections.Generic.List[string]
+    $prev = $main; $pw = $w; $ph = $h
+    for ($k = 0; $k -lt $secNames.Count; $k++) {
+        $n = $secNames[$k]; $sec = $layout.Sections[$k]
+        if ($k -eq $mainIdx -or $sec.Length -eq 0) { continue }
+        if ($n -eq 'Data' -or $n -eq 'Original') {
+            # secondary pixel section (preview in newer files)
+            $pl = [GhTool.VdbWriter]::DecodeSection($sec)
+            $pi = [GhTool.VdbWriter]::ParsePixels($pl)
+            if ($pi.Kind -ne 'Image') { continue }
+            $rgba = [GhTool.VdbWriter]::Resize($main, $w, $h, $pi.Width, $pi.Height, 'stretch', $bg[0], $bg[1], $bg[2], 255)
+            $st = if ($pi.PixelLength % $pi.Height -eq 0 -and $pi.PixelLength / $pi.Height -ge $pi.Width * $pi.Channels) { $pi.PixelLength / $pi.Height } else { $pi.Width * $pi.Channels }
+            [GhTool.VdbWriter]::WritePixels($rgba, $pi.Width, $pi.Height, $pi.GlFormat, $pi.Channels, $flip, $pl, $pi.PixelOffset, [int]$st, $bg[0], $bg[1], $bg[2])
+            $layout.Sections[$k] = [GhTool.VdbWriter]::BuildDataSectionLevel($pl, [GhTool.VdbWriter]::FirstRawChunk($sec), $false)
+            $notes.Add("$n preview $($pi.Width)×$($pi.Height)")
+        }
+        elseif ($n -match '^MMLevel\.') {
+            $pl = [GhTool.VdbWriter]::DecodeSection($sec)
+            $m = [GhTool.VdbWriter]::FindMip($pl)
+            if (-not $m) { throw "Mipmap section $n not recognised: replacement refused." }
+            $mw = $m[0]; $mh = $m[1]
+            if ($m[3] -ne ([Math]::Floor(($mw + 3) / 4) * [Math]::Floor(($mh + 3) / 4) * 8)) { throw "Mipmap $n is not DXT1/BC1: replacement refused." }
+            $rgba = [GhTool.VdbWriter]::Resize($prev, $pw, $ph, $mw, $mh, 'stretch', $bg[0], $bg[1], $bg[2], 255)
+            [GhTool.VdbWriter]::EncodeBC1($rgba, $mw, $mh, $flip, $pl, $m[2])
+            $layout.Sections[$k] = [GhTool.VdbWriter]::BuildDataSectionLevel($pl, [GhTool.VdbWriter]::FirstRawChunk($sec), ($pl.Length -gt 16MB))
+            $results[$n] = $pl
+            $prev = $rgba; $pw = $mw; $ph = $mh
+        }
+    }
+    if ($info.MipLevels) { $notes.Add("$($info.MipLevels) mipmap levels regenerated") }
 
     $thumbNote = 'thumbnails regenerated'
-    foreach ($k in @($iS, $iI)) {
-        if ($k -lt 0) { continue }
+    for ($k = 0; $k -lt $secNames.Count; $k++) {
+        if ($secNames[$k] -notmatch '^Icon') { continue }
         $sec = $layout.Sections[$k]
         $tw = [GhTool.VdbWriter]::IconWidth($sec); $th = [GhTool.VdbWriter]::IconHeight($sec)
-        if ($tw -lt 1 -or $th -lt 1 -or $tw -gt 1024 -or $th -gt 1024) { $thumbNote = 'original thumbnails kept (unknown template)'; continue }
-        $t = [GhTool.VdbWriter]::Resize($rgba, $w, $h, $tw, $th, 'stretch', 0, 0, 0, 255)
+        if ($tw -lt 1 -or $th -lt 1 -or $tw -gt 4096 -or $th -gt 4096) { $thumbNote = 'original thumbnails kept (unknown template)'; continue }
+        $t = [GhTool.VdbWriter]::Resize($main, $w, $h, $tw, $th, 'stretch', 0, 0, 0, 255)
         $jpg = [GhTool.VdbWriter]::EncodeJpeg($t, $tw, $th, 90)
         $ns = [GhTool.VdbWriter]::RebuildIconSection($sec, $jpg, $tw, $th)
         if ($ns) { $layout.Sections[$k] = $ns } else { $thumbNote = 'original thumbnails kept (unknown template)' }
     }
+    $notes.Insert(0, $thumbNote)
+    $main = $null; $prev = $null
     $newBytes = [GhTool.VdbWriter]::Build($layout)
 
     # Verification: re-read the new file with the independent reader
@@ -2063,13 +2796,19 @@ function New-GhReplacement([string]$path, [string]$imagePath, $a) {
     $staged = Join-Path $script:StagingDir "$($info.Uuid).vdb"
     [IO.File]::WriteAllBytes($staged, $newBytes)
     $chk = [GhTool.Vdb]::Inspect($staged)
-    if ($chk.Kind -ne 'Image' -or $chk.Width -ne $w -or $chk.Height -ne $h -or $chk.GlFormat -ne $info.GlFormat -or $chk.Name -ne $info.Name) { throw 'Verification failed: the rebuilt file does not read back correctly.' }
+    if ($chk.Kind -ne 'Image' -or $chk.Width -ne $info.Width -or $chk.Height -ne $info.Height -or $chk.GlFormat -ne $info.GlFormat -or $chk.Name -ne $info.Name -or $chk.Sections -ne $info.Sections) { throw 'Verification failed: the rebuilt file does not read back correctly.' }
     if ($chk.ThumbCount -ne $info.ThumbCount) { throw 'Verification failed: unreadable thumbnails.' }
-    if (-not [GhTool.VdbWriter]::SameBytes([GhTool.Vdb]::ReadPayload($chk), $newPayload)) { throw 'Verification failed: decompressed data differs.' }
+    if (-not [GhTool.VdbWriter]::SameBytes([GhTool.Vdb]::ReadPayload($chk), $newMainPl)) { throw 'Verification failed: decompressed data differs.' }
     $re = [GhTool.VdbWriter]::Parse($newBytes)
+    for ($k = 0; $k -lt $secNames.Count; $k++) {
+        if ($results.ContainsKey($secNames[$k]) -and $secNames[$k] -ne $info.PixelSection) {
+            if (-not [GhTool.VdbWriter]::SameBytes([GhTool.VdbWriter]::DecodeSection($re.Sections[$k]), $results[$secNames[$k]])) { throw "Verification failed: section $($secNames[$k]) differs." }
+        }
+    }
+    $oldPl = [GhTool.Vdb]::ReadPayload($info)
 
-    return [pscustomobject]@{ Info = $info; Path = $path; Bytes = $newBytes; Staged = $staged; Payload = $payload; NewPayload = $newPayload
-        Mode = $mode; Source = "$($src.W)×$($src.H)"; Thumbs = $thumbNote; OldSize = $orig.Length }
+    return [pscustomobject]@{ Info = $info; Check = $chk; Path = $path; Bytes = $newBytes; Staged = $staged; Payload = $oldPl; NewPayload = $newMainPl
+        Mode = $mode; Source = "$($imagePath)"; Thumbs = ($notes -join ', '); OldSize = $orig.Length; SrcSize = '' }
 }
 
 function Invoke-GhReplace($a) {
@@ -2080,17 +2819,18 @@ function Invoke-GhReplace($a) {
     $r = New-GhReplacement $path $img $a
     $i = $r.Info
     Write-Gh ("  Object     : {0}  [{1}]  {2}×{3} {4}" -f $i.Name, $i.Uuid, $i.Width, $i.Height, $i.PixelFormat)
-    Write-Gh ("  Source     : {0} ({1}) -> {2}×{3}, mode {4}" -f (Split-Path $img -Leaf), $r.Source, $i.Width, $i.Height, $r.Mode)
+    Write-Gh ("  Source     : {0} -> {1}×{2}, mode {3}" -f (Split-Path $img -Leaf), $i.Width, $i.Height, $r.Mode)
     Write-Gh ("  File       : {0} -> {1}  ({2})" -f (Format-Size $r.OldSize), (Format-Size $r.Bytes.Length), $r.Thumbs)
     Write-GhOk 'Structure rebuilt and read back successfully'
 
     $prev = Join-Path $script:StagingDir "$($i.Uuid)_before.png"; $next = Join-Path $script:StagingDir "$($i.Uuid)_after.png"
-    [GhTool.Vdb]::WriteImagePng($i, $r.Payload, $prev, $true)
-    $chk = [GhTool.Vdb]::Inspect($r.Staged)
-    [GhTool.Vdb]::WriteImagePng($chk, $r.NewPayload, $next, $true)
+    [GhTool.Vdb]::WriteThumbPng($i, $r.Payload, $prev, $true, 1024)
+    [GhTool.Vdb]::WriteThumbPng($r.Check, $r.NewPayload, $next, $true, 1024)
     Write-Gh "  Previews   : $prev" DarkGray
     Write-Gh "               $next" DarkGray
 
+    $users = @(Get-GhRefList $i.Uuid 'usedby')
+    if ($users.Count) { Write-Gh ("  Used by    : {0} object(s): {1}" -f $users.Count, ((@($users | Select-Object -First 8 | ForEach-Object { (Get-GhObjectLabel $_).Name })) -join ', ')) }
     if (-not $a.Opt.apply) {
         Write-Gh ''
         Write-Gh "  DRY RUN: nothing was changed in the Graphic Hub." Yellow
@@ -2153,6 +2893,1644 @@ function Invoke-GhRestore($a) {
     Write-GhOk 'Original restored (content identical to the backup)'
 }
 
+function ConvertTo-GhJsonString([string]$s) { return ($s | ConvertTo-Json -Compress) }
+
+function Invoke-GhScene2Html($a) {
+    $root = Get-GhRoot
+    $path = Resolve-GhObject ($a.Pos -join ' ')
+    $i = [GhTool.Vdb]::Inspect($path)
+    if ($i.Kind -ne 'Scene') { throw "Object $($i.Uuid) is not a scene ($($i.Kind))." }
+    Write-GhTitle "Scene to HTML: $($i.Name)"
+    $tree = [GhTool.Vdb]::SceneTreeJson($i)
+    if (-not $tree) { throw 'The scene data could not be read.' }
+
+    # preview (largest thumbnail) for the overlay
+    $prev = ''
+    $best = -1; for ($t = 0; $t -lt $i.ThumbCount; $t++) { if ($best -lt 0 -or $i.Thumbs[$t].Width -gt $i.Thumbs[$best].Width) { $best = $t } }
+    if ($best -ge 0) { $prev = [Convert]::ToBase64String([GhTool.Vdb]::ReadThumb($i, $best)) }
+
+    # images / fonts referenced by the scene (searched in the GH reference table)
+    $images = New-Object System.Collections.Generic.List[string]
+    $fonts = New-Object System.Collections.Generic.List[string]
+    if (-not $a.Opt.norefs) {
+        $refs = New-Object System.Collections.Generic.List[string]
+        $rt = Get-GhRefs
+        if ($rt) {
+            foreach ($u in (Get-GhRefList $i.Uuid 'uses')) {
+                if (-not $refs.Contains($u)) { $refs.Add($u) }
+                # one level deeper: materials and other objects used by the scene can carry images
+                foreach ($u2 in (Get-GhRefList $u 'uses')) { if (-not $refs.Contains($u2)) { $refs.Add($u2) } }
+            }
+            Write-Gh "  Objects used by this scene (ReferenceCollection): $($refs.Count)" DarkGray
+        } else { Write-Gh '  No ReferenceCollection table in this Graphic Hub.' DarkGray }
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) "ghtool_s2h_$([Guid]::NewGuid().ToString('N')).png"
+        foreach ($u in $refs) {
+            $p = Join-Path (Join-Path $root $u.Substring(0, 1)) "$u.vdb"
+            if (-not (Test-Path -LiteralPath $p)) { Write-Gh "    missing [$($u.Substring(0, 8))] (listed in ReferenceCollection but not in this Graphic Hub)" DarkGray; continue }
+            $ri = [GhTool.Vdb]::Inspect($p)
+            if ($ri.Kind -eq 'Image' -and $ri.Channels -ge 1) {
+                try {
+                    [GhTool.Vdb]::WriteThumbPng($ri, [GhTool.Vdb]::ReadPayload($ri), $tmp, $true, 1920)
+                    $src = 'data:image/png;base64,' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($tmp))
+                    $images.Add('{"u":' + (ConvertTo-GhJsonString $u) + ',"n":' + (ConvertTo-GhJsonString "$($ri.Name)") + ',"src":' + (ConvertTo-GhJsonString $src) + '}')
+                    Write-Gh "    image  $($ri.Name)  [$($u.Substring(0, 8))]  $($ri.Width)×$($ri.Height)"
+                } catch { Write-GhWarn "Image $u could not be decoded: $($_.Exception.Message)" }
+            } elseif ($ri.Kind -eq 'Font') {
+                $fonts.Add('{"u":' + (ConvertTo-GhJsonString $u) + ',"n":' + (ConvertTo-GhJsonString "$($ri.Name)") + '}')
+                Write-Gh "    font   $($ri.Name)  [$($u.Substring(0, 8))]"
+            } else { Write-Gh "    $($ri.Kind.ToLower())  $($ri.Name)  [$($u.Substring(0, 8))]" DarkGray }
+        }
+        # 2) by name: Viz names a container after the image dropped on it, so look for images with the same name
+        $names = @([GhTool.Vdb]::Scene($i).Containers | ForEach-Object { "$_" } | Sort-Object -Unique)
+        $imgIdx = @(Get-GhIndex | Where-Object { $_.Kind -eq 'Image' -and $_.Name })
+        $byName = @{}
+        foreach ($im in $imgIdx) { $k = $im.Name.ToLowerInvariant(); if (-not $byName.ContainsKey($k)) { $byName[$k] = New-Object System.Collections.Generic.List[object] }; $byName[$k].Add($im) }
+        $nameHits = 0
+        foreach ($cn in $names) {
+            $k = ($cn -replace '_\(\d+\)$', '' -replace '\.(png|jpe?g|tga|tiff?|bmp|psd)$', '').ToLowerInvariant()
+            if (-not $byName.ContainsKey($k)) { continue }
+            foreach ($im in $byName[$k]) {
+                if ($refs.Contains($im.Uuid)) { continue }
+                $refs.Add($im.Uuid); $nameHits++
+                try {
+                    $ri = [GhTool.Vdb]::Inspect($im.Path)
+                    [GhTool.Vdb]::WriteThumbPng($ri, [GhTool.Vdb]::ReadPayload($ri), $tmp, $true, 1920)
+                    $src = 'data:image/png;base64,' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($tmp))
+                    $images.Add('{"u":' + (ConvertTo-GhJsonString $im.Uuid) + ',"n":' + (ConvertTo-GhJsonString "$cn") + ',"src":' + (ConvertTo-GhJsonString $src) + '}')
+                    Write-Gh "    image  $($ri.Name)  [$($im.Uuid.Substring(0, 8))]  $($ri.Width)×$($ri.Height)  (same name as container '$cn')"
+                } catch { Write-GhWarn "Image $($im.Uuid) could not be decoded: $($_.Exception.Message)" }
+            }
+        }
+        if ($nameHits) { Write-Gh "  Images matched by container name: $nameHits" DarkGray }
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        if (-not $refs.Count) { Write-Gh '  (No references found: textures will be placeholders you can replace in the page.)' DarkGray }
+    }
+
+    $viz = 0; if ($i.AppVersion -match '^(\d+)') { $viz = [int]$Matches[1] }
+    $font = if ($a.Opt.font) { "$($a.Opt.font), Arial, sans-serif" } else { '' }
+    $json = '{"viz":' + $viz + ',"name":' + (ConvertTo-GhJsonString "$($i.Name)") + ',"uuid":' + (ConvertTo-GhJsonString $i.Uuid) +
+        ',"font":' + (ConvertTo-GhJsonString $font) + ',"preview":' + (ConvertTo-GhJsonString $prev) +
+        ',"images":[' + ($images -join ',') + '],"fonts":[' + ($fonts -join ',') + '],' + $tree + '}'
+    $json = $json.Replace('</', '<\/')
+    $html = $script:GhSceneTemplate.Replace('__TITLE__', [Net.WebUtility]::HtmlEncode("$($i.Name)")).Replace('__SCENE__', $json)
+
+    $out = if ($a.Opt.out) { $a.Opt.out } else { Join-Path (Get-Location).ProviderPath ("{0}_{1}.html" -f (Get-SafeName $i.Name), $i.Uuid.Substring(0, 8)) }
+    if ($out -notmatch '\.html?$') { $dir = Assert-GhOutside $out; $out = Join-Path $dir ("{0}_{1}.html" -f (Get-SafeName $i.Name), $i.Uuid.Substring(0, 8)) }
+    else { [void](Assert-GhOutside (Split-Path -Parent ([IO.Path]::GetFullPath($out)))) }
+    [IO.File]::WriteAllText($out, $html, (New-Object Text.UTF8Encoding($false)))
+    Write-GhOk "HTML written: $out ($(Format-Size (Get-Item -LiteralPath $out).Length))"
+    if (-not $a.Opt.noopen) { try { Invoke-Item -LiteralPath $out } catch { } }
+}
+
+$script:GhSceneTemplate = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ – Viz scene preview</title>
+<style>
+  :root { --bg:#121417; --panel:#1b1e23; --line:#2b3038; --text:#e6e8eb; --mute:#8b929c; --acc:#4da3ff; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.4 "Segoe UI", system-ui, sans-serif; }
+  #app { display:grid; grid-template-columns:1fr 340px; grid-template-rows:auto 1fr auto; height:100%; }
+  header { grid-column:1/-1; display:flex; align-items:center; gap:12px; padding:8px 14px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  header .mute { color:var(--mute); font-size:12px; }
+  #viewport { position:relative; overflow:hidden; display:flex; align-items:center; justify-content:center; padding:12px; }
+  #frame { position:relative; width:1920px; height:1080px; transform-origin:0 0; flex:none; overflow:hidden; }
+  #frame.bg-checker { background:conic-gradient(#3a3f47 25%, #2c3037 0 50%, #3a3f47 0 75%, #2c3037 0) 0 0/40px 40px; }
+  #frame.bg-black { background:#000; }
+  #frame.bg-transparent { background:transparent; }
+  #stage { position:absolute; left:960px; top:540px; width:0; height:0; transform-style:preserve-3d; }
+  #cv { position:absolute; inset:0; width:100%; height:100%; }
+  .g { position:absolute; }
+  .txt { white-space:pre; font-family:Arial, "Helvetica Neue", sans-serif; line-height:1; transform-origin:0 0; }
+  .ph { background:repeating-linear-gradient(45deg,#666a 0 12px,#8889 12px 24px); outline:2px dashed #ffffff80; outline-offset:-2px;
+        display:flex; align-items:center; justify-content:center; overflow:hidden; background-size:cover; background-position:center; }
+  .ph span { font:600 22px Arial; color:#fff; text-shadow:0 0 4px #000; padding:4px; text-align:center; }
+  #ref { position:absolute; inset:0; width:100%; height:100%; opacity:0; pointer-events:none; }
+  aside { grid-row:2/4; grid-column:2; border-left:1px solid var(--line); background:var(--panel); overflow:auto; padding:12px; }
+  aside h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mute); margin:14px 0 8px; }
+  aside h2:first-child { margin-top:0; }
+  label.f { display:block; margin-bottom:10px; }
+  label.f span { display:block; color:var(--mute); font-size:12px; margin-bottom:3px; }
+  input[type=text], textarea, select { width:100%; background:#0d0f12; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; }
+  textarea { resize:vertical; min-height:34px; }
+  footer { grid-column:1; display:flex; align-items:center; gap:10px; padding:8px 14px; border-top:1px solid var(--line); }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 12px; font:inherit; cursor:pointer; }
+  button.primary { background:var(--acc); color:#06121f; border-color:var(--acc); font-weight:600; }
+  #time { flex:1; }
+  #clock { font-variant-numeric:tabular-nums; color:var(--mute); width:120px; text-align:right; }
+  .tree { font:12px/1.5 ui-monospace, Consolas, monospace; }
+  .tree div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:default; }
+  .tree div.off { color:var(--mute); text-decoration:line-through; }
+  .tree div:hover { color:var(--acc); }
+  .note { color:var(--mute); font-size:12px; }
+  .hl { outline:2px solid var(--acc) !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>__TITLE__</h1>
+    <span class="mute" id="summary"></span>
+    <span style="flex:1"></span>
+    <label class="mute">Background
+      <select id="bg" style="width:auto"><option value="checker">Checker</option><option value="black">Black</option><option value="transparent">Transparent</option></select>
+    </label>
+    <label class="mute"><input type="checkbox" id="minv"> Invert masks</label>
+    <label class="mute">Viz preview overlay <input type="range" id="refop" min="0" max="100" value="0" style="vertical-align:middle"></label>
+  </header>
+  <div id="viewport"><div id="frame" class="bg-checker"><canvas id="cv" width="1920" height="1080"></canvas><img id="ref" alt=""></div></div>
+  <aside>
+    <h2>Data</h2>
+    <div id="form"></div>
+    <h2>Layers</h2>
+    <div class="tree" id="tree"></div>
+    <h2>About this preview</h2>
+    <p class="note">Generated by GHTool from the Viz scene data. Approximations: fonts are replaced with Arial, images used by the
+      scene are shown as placeholders (load your own in the form), Viz scripts and some plugins are not executed.</p>
+    <div id="skipped" class="note"></div>
+  </aside>
+  <footer>
+    <button class="primary" id="play">▶ Play</button>
+    <button id="cont">⏭ Continue</button>
+    <button id="stop">■ Stop</button>
+    <label class="mute"><input type="checkbox" id="loop"> Loop</label>
+    <input type="range" id="time" min="0" max="1000" value="0">
+    <span id="clock">0.00 s</span>
+  </footer>
+</div>
+<script type="application/json" id="scene">__SCENE__</script>
+<script>
+(function () {
+  'use strict';
+  var S = JSON.parse(document.getElementById('scene').textContent);
+  var FONT = S.font || 'Arial, "Helvetica Neue", sans-serif';
+  var UNIT = 1080 / 414.2135;          // Viz units -> pixels (default camera: z=500, vertical FOV 45 degrees)
+  var PERSP = 500 * UNIT;
+
+  // ---------- raw tree helpers ----------
+  function hexBytes(h) { var b = new Uint8Array(h.length / 2); for (var i = 0; i < b.length; i++) b[i] = parseInt(h.substr(i * 2, 2), 16); return b; }
+  function N(a) { return { tag: a[0], hex: a[1], kids: (a[2] || []).map(N) }; }
+  function kid(n, tag) { if (!n) return null; for (var i = 0; i < n.kids.length; i++) if (n.kids[i].tag === tag) return n.kids[i]; return null; }
+  function kidsOf(n, tag) { return n ? n.kids.filter(function (k) { return k.tag === tag; }) : []; }
+  function path(n) { for (var i = 1; i < arguments.length && n; i++) n = kid(n, arguments[i]); return n; }
+  function dv(n) { var b = hexBytes(n.hex); return new DataView(b.buffer); }
+  function f32(n, i) { return n && n.hex.length >= (i + 1) * 8 ? dv(n).getFloat32(i * 4, true) : null; }
+  function f3(n) { return n && n.hex.length >= 24 ? [f32(n, 0), f32(n, 1), f32(n, 2)] : null; }
+  function f4(n) { return n && n.hex.length >= 32 ? [f32(n, 0), f32(n, 1), f32(n, 2), f32(n, 3)] : null; }
+  function i32(n) { return n && n.hex.length >= 8 ? dv(n).getInt32(0, true) : null; }
+  function u8(n) { return n && n.hex.length >= 2 ? parseInt(n.hex.substr(0, 2), 16) : null; }
+  function f64(n) { return n && n.hex.length >= 16 ? dv(n).getFloat64(0, true) : null; }
+  function str(n) {
+    if (!n || n.hex.length < 4) return '';
+    var b = hexBytes(n.hex), L = b[0] | (b[1] << 8);
+    try { return new TextDecoder('utf-8').decode(b.subarray(2, 2 + L)); } catch (e) { return ''; }
+  }
+  function findAll(n, tag, acc) { acc = acc || []; if (n.tag === tag) acc.push(n); n.kids.forEach(function (k) { findAll(k, tag, acc); }); return acc; }
+  function wrapped(n) { var w = kid(n, 0x0001); return w && w.kids[0] ? w.kids[0] : null; }   // 0650 > 0001 > 0650
+
+  // generic plugin parameter list: 062e name, 0631 type, then value
+  function params(list) {
+    var p = {}, cur = null;
+    if (!list) return p;
+    list.kids.forEach(function (k) {
+      if (k.tag === 0x062e) { cur = str(k); return; }
+      if (cur === null || k.tag === 0x0631) return;
+      var v;
+      switch (k.tag) {
+        case 0x062a: v = f32(k, 0); break;
+        case 0x062d: v = i32(k); break;
+        case 0x0625: v = u8(k) === 1; break;
+        case 0x0626: var b = hexBytes(k.hex); v = [b[0], b[1], b[2], b[3]]; break;
+        case 0x062f: v = str(k); break;
+        default: v = k.hex.length === 24 ? f3(k) : (k.hex || null);
+      }
+      p[cur] = v; cur = null;
+    });
+    return p;
+  }
+
+  // ---------- animation channels ----------
+  function readChannels(holder, prop) {
+    var out = [], ch = kid(holder, 0x0223);
+    if (!ch) return out;
+    kidsOf(ch, 0x02a0).forEach(function (grp) {
+      grp.kids.forEach(function (c) {
+        var keysNode = kid(c, 0x02ae);
+        if (!keysNode) return;
+        var name = str(kid(c, 0x02b1)) || prop;
+        var pathPts = findAll(c, 0x0614).map(function (p) { return f3(kid(p, 0x0615)); });
+        var keys = keysNode.kids.map(function (k) {
+          var t = f64(kid(k, 0x05c6)), vn = kid(k, 0x05c7), v = null;
+          if (vn) {
+            if (vn.kids.length) { var s3 = path(vn, 0x0680, 0x0410) || wrapped(vn) || vn.kids[0]; v = f3(s3) || f4(s3); }
+            else if (vn.hex.length === 24) v = f3(vn);
+            else if (vn.hex.length === 32) v = f4(vn);
+            else if (vn.hex.length === 8) v = f32(vn, 0);
+          }
+          return { t: t || 0, v: v };
+        }).filter(function (k) { return k.v !== null; });
+        if (keys.length) out.push({ name: name, prop: prop, keys: keys, path: pathPts });
+      });
+    });
+    return out;
+  }
+
+  // ---------- containers ----------
+  var all = [], skipped = {};
+  function readContainer(c) {
+    var o = { node: c, name: str(kid(c, 0x0317)) || 'noname', active: u8(kid(c, 0x0301)) !== 0, kids: [], anims: [], funcs: [] };
+    var t = path(c, 0x07b0, 0x07b0);
+    o.pos = f3(wrapped(kid(t, 0x0650))) || [0, 0, 0];
+    o.rot = f3(wrapped(kid(t, 0x0670))) || [0, 0, 0];
+    o.scale = f3(path(t, 0x0680, 0x0680, 0x0410)) || [1, 1, 1];
+    o.center = f3(wrapped(kid(t, 0x0290))) || [0, 0, 0];
+    if (t) o.anims = readChannels(t, 'transform');
+    // material
+    var m = path(c, 0x0314, 0x0600);
+    if (m) {
+      var col = f4(wrapped(kid(m, 0x0603))) || f4(wrapped(kid(m, 0x0604)));
+      o.color = col; var a = f32(kid(m, 0x0601), 0); o.matAlpha = a === null ? 1 : a;
+    }
+    // alpha
+    var al = path(c, 0x0302, 0x0220);
+    if (al) { var a0 = f32(kid(al, 0x0226), 0); o.alpha = a0 === null ? undefined : a0 * 100;   // stored as 0..1, keyframes use 0..100
+      o.anims = o.anims.concat(readChannels(al, 'alpha')); }
+    // texture
+    if (kid(c, 0x0322)) o.texture = true;
+    // geometry
+    var g = path(c, 0x030d, 0x030d, 0x0581);
+    if (g) {
+      var kind = str(kid(g, 0x0522));
+      if (kind === 'Plugin') { var pl = path(g, 0x0500, 0x0524); o.geom = { type: str(kid(pl, 0x0623)), p: params(kid(pl, 0x0624)) }; }
+      else if (kind === 'ClassicText' || path(g, 0x0500, 0x0550)) {
+        var tx = path(g, 0x0500, 0x0550);
+        var jb = kid(tx, 0x0557), jv = jb ? dv(jb) : null;
+        o.geom = { type: 'Text', text: str(kid(tx, 0x056e)).replace(/\n$/, ''), h: jv && jb.hex.length >= 8 ? jv.getInt32(0, true) : 1, v: jv && jb.hex.length >= 16 ? jv.getInt32(4, true) : 6 };
+      } else o.geom = { type: kind || 'Geometry' };
+    }
+    // function plugins
+    var fl = path(c, 0x030c, 0x04e0, 0x04e1);
+    if (fl) kidsOf(fl, 0x0001).forEach(function (w) { var f = w.kids[0]; if (f) o.funcs.push({ type: str(kid(f, 0x0623)), p: params(kid(f, 0x0624)) }); });
+    // clipping to a reference container (Viz "clip" option: the container is cut to another container's shape)
+    var cl = path(c, 0x0331, 0x0a00);
+    if (cl && u8(kid(cl, 0x0a06)) === 1) { var ref = str(kid(cl, 0x0a07)); if (ref) o.clipRef = ref.replace(/^CONTAINER\|/, ''); }
+    // script
+    var sc = findAll(c, 0x0702)[0];
+    if (sc && kid(c, 0x0700)) o.script = str(sc);
+    all.push(o);
+    return o;
+  }
+  function readList(list, parent) {
+    var last = null;
+    list.kids.forEach(function (k) {
+      if (k.tag === 0x07c4) { var cn = kid(k, 0x0300); if (cn) { last = readContainer(cn); last.parent = parent; parent.kids.push(last); } }
+      else if (k.tag === 0x07c5 && last) readList(k, last);
+    });
+  }
+  var raw = N(S.tree), rootList = findAll(raw, 0x07c5)[0];
+  var root = { name: 'scene', kids: [], anims: [], funcs: [], pos: [0, 0, 0], rot: [0, 0, 0], scale: [1, 1, 1], center: [0, 0, 0], active: true };
+  if (rootList) readList(rootList, root);
+
+  // ---------- clip references: "T0/1/2/3/1" = 1-based child indices from the top of the scene tree ----------
+  all.forEach(function (o) {
+    if (!o.clipRef) return;
+    var parts = o.clipRef.split('/'), cur = root;
+    for (var i = 1; i < parts.length && cur; i++) cur = cur.kids[parseInt(parts[i], 10) - 1];
+    o.clipTo = cur && cur !== root ? cur : null;
+  });
+  // ---------- masks, stop points ----------
+  all.forEach(function (o) { o.maskSrc = 0; o.maskDst = 0; });
+  (function scanMasks(list) {
+    list.kids.forEach(function (k) {
+      if (k.tag === 0x07c4) { var cn = kid(k, 0x0300), o = cn && all.find(function (x) { return x.node === cn; });
+        if (o) { var ms = path(cn, 0x0304, 0x0261), md = path(cn, 0x0306, 0x0262); if (ms) o.maskSrc = i32(kid(ms, 0x0260)) || 0; if (md) o.maskDst = i32(kid(md, 0x0260)) || 0; /* bits 0 = mask switched off */ } }
+      else if (k.tag === 0x07c5) scanMasks(k);
+    });
+  })(rootList || { kids: [] });
+  var stops = [];
+  if (S.stage) findAll(N(S.stage), 0x05b7).forEach(function (ev) {
+    var t = f64(kid(ev, 0x05c6)), kind = i32(kid(ev, 0x05c7));
+    if (t > 0.001 && kind === 0 && stops.indexOf(t) < 0) stops.push(t);
+  });
+  stops.sort(function (a, b) { return a - b; });
+
+  // ---------- 2D renderer (canvas, Viz units, y up) ----------
+  var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  function mul(m, n) { return [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]]; }
+  var D2R = Math.PI / 180;
+  function localMatrix(st) {
+    var r = st.rot[2] * D2R, cs = Math.cos(r), sn = Math.sin(r);
+    var sx = st.scale[0] * Math.cos(st.rot[1] * D2R), sy = st.scale[1] * Math.cos(st.rot[0] * D2R);
+    var m = [cs * sx, sn * sx, -sn * sy, cs * sy, st.pos[0], st.pos[1]];
+    return mul(m, [1, 0, 0, 1, -st.center[0], -st.center[1]]);
+  }
+  function css(c, a) { return 'rgba(' + Math.round(c[0] * 255) + ',' + Math.round(c[1] * 255) + ',' + Math.round(c[2] * 255) + ',' + a + ')'; }
+  function rgba8(c) { return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (c[3] / 255) + ')'; }
+  // Shape of a geometry in its own units: box (cx, cy = centre offset from the origin), corner radii, shear, outline, crop
+  function geomBox(o) {
+    var g = o.geom, p = (g && g.p) || {};
+    if (!g) return null;
+    var sh = { w: 100, h: 100, cx: 0, cy: 0, round: false, r: [0, 0, 0, 0], shear: 0, outline: 0, crop: null };
+    if (/circle|disc|ring/i.test(g.type)) { var rr = p.radius || p.outer_radius || 50; sh.w = sh.h = 2 * rr; sh.round = true; return sh; }
+    if (g.type === 'Image') { sh.w = 100; sh.h = 56.25; return sh; }
+    if (!(p.width !== undefined || /rect|noggi|clip|image/i.test(g.type))) return null;
+    sh.w = p.width === undefined ? 100 : p.width; sh.h = p.height === undefined ? 100 : p.height;
+    if (g.type === 'Noggi') {
+      // Viz order: bevel top/right, top/left, bottom/left, bottom/right; alignment 0 = left/bottom, 1 = centre/middle, 2 = right/top
+      sh.r = [p.bevel_0 || 0, p.bevel_1 || 0, p.bevel_2 || 0, p.bevel_3 || 0];
+      var ha = p.hAlignment === undefined ? 1 : p.hAlignment, va = p.vAlignment === undefined ? 1 : p.vAlignment;
+      sh.cx = ha === 0 ? sh.w / 2 : ha === 2 ? -sh.w / 2 : 0;
+      sh.cy = va === 0 ? sh.h / 2 : va === 2 ? -sh.h / 2 : 0;
+      sh.shear = (p.stretch || 0) / 100;
+      if (p.geomType === 1) sh.outline = p.outlineWidth || 1;
+      if (p.doCrop) sh.crop = [p.crop_left, p.crop_right, p.crop_bottom, p.crop_top];   // percent of the size, from the centre
+    } else if (/rect/i.test(g.type) && p.bevel) {
+      sh.r = [p.bevel, p.bevel, p.bevel, p.bevel];
+    }
+    return sh;
+  }
+  function tracePath(sh) {
+    if (sh.round) { ctx.ellipse(sh.cx, sh.cy, sh.w / 2, sh.h / 2, 0, 0, 7); return; }
+    var w = sh.w / 2, h = sh.h / 2, x = sh.cx, y = sh.cy, k = sh.shear;
+    var lim = Math.min(w, h);
+    var tr = Math.min(lim, Math.max(0, sh.r[0])), tl = Math.min(lim, Math.max(0, sh.r[1])), bl = Math.min(lim, Math.max(0, sh.r[2])), br = Math.min(lim, Math.max(0, sh.r[3]));
+    function P(px, py) { return [x + px + k * py, y + py]; }            // shear for the stretch parameter
+    var pts = [], seg = 6;
+    function corner(cx, cy, r, a0) {
+      if (r <= 0) { pts.push(P(cx, cy)); return; }
+      var ox = cx - Math.sign(cx) * r, oy = cy - Math.sign(cy) * r;
+      for (var i = 0; i <= seg; i++) { var a = a0 + (Math.PI / 2) * i / seg; pts.push(P(ox + r * Math.cos(a), oy + r * Math.sin(a))); }
+    }
+    corner(w, h, tr, 0); corner(-w, h, tl, Math.PI / 2); corner(-w, -h, bl, Math.PI); corner(w, -h, br, 1.5 * Math.PI);
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+  }
+  function cropClip(sh) {
+    if (!sh.crop) return;
+    var c = sh.crop, x0 = sh.cx + (c[0] / 100) * sh.w, x1 = sh.cx + (c[1] / 100) * sh.w, y0 = sh.cy + (c[2] / 100) * sh.h, y1 = sh.cy + (c[3] / 100) * sh.h;
+    ctx.beginPath(); ctx.rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)); ctx.clip();
+  }
+  var maskInvert = false;  // user override of the automatic mask mode (see clipTo)
+  var hatch = null;
+  function hatchPattern() {
+    if (hatch) return hatch;
+    var c = document.createElement('canvas'); c.width = c.height = 24; var x = c.getContext('2d');
+    x.fillStyle = '#777'; x.fillRect(0, 0, 24, 24); x.strokeStyle = '#999'; x.lineWidth = 8;
+    x.beginPath(); x.moveTo(-6, 30); x.lineTo(30, -6); x.stroke(); hatch = ctx.createPattern(c, 'repeat'); return hatch;
+  }
+  function setT(m, f) { var s = [UNIT * f, 0, 0, -UNIT * f, 960, 540], t = mul(s, m); ctx.setTransform(t[0], t[1], t[2], t[3], t[4], t[5]); }
+
+  function evalState(o, t) {
+    var st = { pos: o.pos.slice(), rot: o.rot.slice(), scale: o.scale.slice(), center: o.center, alpha: o.alpha === undefined ? 100 : o.alpha };
+    o.anims.forEach(function (a) {
+      var v = sample(a, t), n = a.name.toLowerCase();
+      if (a.prop === 'alpha' || n === 'alpha') { if (typeof v === 'number') st.alpha = v; return; }
+      if (n.indexOf('position') === 0) {
+        if (a.path.length >= 2 && typeof v === 'number') { var pp = pathPoint(a.path, v); if (pp) st.pos = pp; }
+        else if (Array.isArray(v)) st.pos = v.slice(0, 3);
+        else if (/x$/.test(n)) st.pos[0] = v; else if (/y$/.test(n)) st.pos[1] = v; else if (/z$/.test(n)) st.pos[2] = v;
+      } else if (n.indexOf('scal') === 0) {
+        if (Array.isArray(v)) st.scale = v.slice(0, 3); else if (/x$/.test(n)) st.scale[0] = v; else if (/y$/.test(n)) st.scale[1] = v; else st.scale = [v, v, v];
+      } else if (n.indexOf('rot') === 0) {
+        if (Array.isArray(v)) st.rot = v.slice(0, 3); else if (/x$/.test(n)) st.rot[0] = v; else if (/y$/.test(n)) st.rot[1] = v; else st.rot[2] = v;
+      }
+    });
+    return st;
+  }
+
+  // world transforms for every container (needed first, because masks can come later in the tree)
+  function layout(o, M, z, zs, t) {
+    o.kids.forEach(function (k) {
+      var st = evalState(k, t);
+      k.M = mul(M, localMatrix(st));
+      k.z = z + st.pos[2] * zs; k.zs = zs * st.scale[2];
+      k.f = 500 / Math.max(50, 500 - k.z);
+      k.a = st.alpha / 100;
+      k.visible = k.active && !k.hidden;
+      layout(k, k.M, k.z, k.zs, t);
+    });
+  }
+  function shapes(o, acc) {   // rectangles of a mask source and its children
+    if (!o.visible) return acc;
+    var b = geomBox(o); if (b) acc.push({ M: o.M, f: o.f, sh: b });
+    o.kids.forEach(function (k) { shapes(k, acc); }); return acc;
+  }
+  var items = [];
+  function collect(o, alpha, color, clips, crops) {
+    o.kids.forEach(function (k) {
+      if (!k.visible) return;
+      var a = alpha * k.a * (k.matAlpha === undefined ? 1 : k.matAlpha);
+      if (a <= 0.001) return;
+      var col = k.color || color, cl = clips, cr = crops;
+      if (k.maskDst) cl = clips.concat([{ bits: k.maskDst, o: k }]);
+      if (k.clipTo) cr = crops.concat([k.clipTo]);
+      if (!k.maskSrc) items.push({ o: k, a: a, col: col, clips: cl, crops: cr, z: k.z, i: items.length });
+      collect(k, a, col, cl, cr);
+    });
+  }
+  // Masks, as the sample scenes behave (Viz 3 and Viz 5): a target is cut by the sources whose mask bits are exactly
+  // the same as its own, and it is hidden where they are. The "Invert masks" box shows it only inside them instead.
+  function clipTo(c) {
+    var bits = c.bits, sh = [], srcs = all.filter(function (m) { return m.maskSrc && m.maskSrc === bits; });
+    var inv = !maskInvert;
+    srcs.forEach(function (m) { shapes(m, sh); });
+    ctx.beginPath();
+    sh.forEach(function (s) { setT(s.M, s.f); tracePath(s.sh); });
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (inv) { ctx.rect(-10, -10, 1940, 1100); ctx.clip('evenodd'); } else if (sh.length) ctx.clip(); else { ctx.rect(0, 0, 0, 0); ctx.clip(); }
+  }
+  function draw() {
+    items = []; collect(root, 1, null, [], []);
+    items.sort(function (x, y) { return (x.z - y.z) || (x.i - y.i); });
+    items.forEach(function (it) {
+      ctx.save();
+      it.clips.forEach(clipTo);
+      it.crops.forEach(function (r) {           // cut to the reference container's shape (even when it is hidden)
+        var b = geomBox(r) || (function () { var ib = innerBox(r, true); return ib && { w: ib[1] - ib[0], h: ib[3] - ib[2], cx: (ib[0] + ib[1]) / 2, cy: (ib[2] + ib[3]) / 2, round: false, r: [0, 0, 0, 0], shear: 0 }; })();
+        if (!b || !r.M) return;
+        setT(r.M, r.f); ctx.beginPath(); tracePath(b); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clip();
+      });
+      ctx.globalAlpha = Math.min(1, it.a);
+      drawGeom(it.o, it.col);
+      ctx.restore();
+    });
+  }
+  function drawGeom(o, col) {
+    var g = o.geom; if (!g) return;
+    setT(o.M, o.f);
+    var b = geomBox(o), p = g.p || {};
+    if (g.type === 'Text') {
+      var lines = (o.text !== undefined ? o.text : g.text).split('\n'), size = 55, lh = size * 1.1;
+      ctx.transform(1, 0, 0, -1, 0, 0);
+      ctx.font = (window.ghBold ? 'bold ' : '') + size + 'px ' + FONT;
+      ctx.fillStyle = col ? css(col, 1) : '#fff';
+      ctx.textAlign = g.h === 3 ? 'right' : g.h === 2 ? 'center' : 'left';
+      ctx.textBaseline = g.v === 3 ? 'middle' : g.v === 1 ? 'top' : 'alphabetic';
+      var y0 = g.v === 3 ? -(lines.length - 1) * lh / 2 : 0;
+      lines.forEach(function (ln, i) { ctx.fillText(ln, 0, y0 + i * lh); });
+      return;
+    }
+    if (!b) { skipped[g.type] = 1; return; }
+    var w = b.w, h = b.h, cx = b.cx, cy = b.cy;
+    ctx.save();
+    cropClip(b);
+    ctx.beginPath(); tracePath(b);
+    if (o.texture || g.type === 'Image') {
+      if (!o.img && /flare|glow|shine|light|blur|shadow|reflex/i.test(o.name)) { ctx.restore(); return; }
+      if (o.img && o.img.complete) { ctx.clip(); ctx.transform(1, 0, 0, -1, 0, 0); ctx.drawImage(o.img, cx - w / 2, -cy - h / 2, w, h); }
+      else {
+        ctx.fillStyle = hatchPattern(); ctx.fill();
+        ctx.transform(1, 0, 0, -1, 0, 0); ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.font = Math.max(4, Math.min(h * 0.18, w / Math.max(4, o.name.length) * 1.6)) + 'px Arial'; ctx.fillText(o.name, cx, -cy);
+      }
+      ctx.restore(); return;
+    }
+    if (p.use_vertexcolors && p.upperleft) {
+      var gr = ctx.createLinearGradient(0, cy + h / 2, 0, cy - h / 2);
+      gr.addColorStop(0, rgba8(p.upperleft)); gr.addColorStop(1, rgba8(p.lowerleft || p.upperleft));
+      if (b.outline) ctx.strokeStyle = gr; else ctx.fillStyle = gr;
+    } else { var cs = col ? css(col, 1) : '#fff'; if (b.outline) ctx.strokeStyle = cs; else ctx.fillStyle = cs; }
+    if (b.outline) { ctx.lineWidth = b.outline; ctx.stroke(); } else ctx.fill();
+    ctx.restore();
+  }
+  function render(t) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, 1920, 1080);
+    runPlugins();
+    layout(root, [1, 0, 0, 1, 0, 0], 0, 1, t);
+    draw();
+  }
+
+  // ---------- animation ----------
+  var duration = 0;
+  all.forEach(function (o) { o.anims.forEach(function (a) { a.keys.sort(function (x, y) { return x.t - y.t; }); duration = Math.max(duration, a.keys[a.keys.length - 1].t); }); });
+  stops.forEach(function (s) { duration = Math.max(duration, s); });
+  function ease(x) { return x * x * (3 - 2 * x); }
+  function lerp(a, b, x) { if (typeof a === 'number') return a + (b - a) * x; return a.map(function (v, i) { return v + ((b[i] === undefined ? v : b[i]) - v) * x; }); }
+  function sample(a, t) {
+    var k = a.keys;
+    if (t <= k[0].t) return k[0].v;
+    if (t >= k[k.length - 1].t) return k[k.length - 1].v;
+    for (var i = 0; i < k.length - 1; i++) if (t >= k[i].t && t <= k[i + 1].t) return lerp(k[i].v, k[i + 1].v, ease((t - k[i].t) / Math.max(1e-9, k[i + 1].t - k[i].t)));
+    return k[k.length - 1].v;
+  }
+  function pathPoint(pts, pct) {
+    var seg = [], tot = 0, i;
+    for (i = 0; i < pts.length - 1; i++) { var d = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1], pts[i + 1][2] - pts[i][2]); seg.push(d); tot += d; }
+    var want = tot * Math.max(0, Math.min(100, pct)) / 100;
+    for (i = 0; i < seg.length; i++) { if (want <= seg[i] || i === seg.length - 1) return lerp(pts[i], pts[i + 1], seg[i] ? Math.min(1, want / seg[i]) : 0); want -= seg[i]; }
+    return pts[0];
+  }
+  function apply(t) { render(t); }
+
+  // ---------- form (control plugins) ----------
+  var form = document.getElementById('form'), fields = [];
+  var byKey = {};
+  all.forEach(function (o) {
+    o.funcs.forEach(function (f) {
+      var id = f.p.field_id, label = f.p.description || o.name, kind = null;
+      if (f.type === 'ControlText') kind = 'text';
+      else if (f.type === 'ControlKeyframe') kind = 'number';
+      else if (f.type === 'ControlImage') kind = 'image';
+      else if (f.type === 'ControlContainer' && f.p.active === true) { kind = 'visible'; label = (label || o.name) + ' – visible'; }
+      if (!kind) return;
+      var key = kind + '|' + (id || o.name);
+      if (byKey[key]) { byKey[key].os.push(o); return; }
+      byKey[key] = { id: id, label: label, kind: kind, o: o, os: [o] }; fields.push(byKey[key]);
+    });
+  });
+  fields.sort(function (a, b) { return String(a.id).localeCompare(String(b.id), 'en', { numeric: true }); });
+  if (!fields.length) form.innerHTML = '<p class="note">This scene has no control fields.</p>';
+  function findText(o) { if (o.geom && o.geom.type === 'Text') return o; for (var i = 0; i < o.kids.length; i++) { var t = findText(o.kids[i]); if (t) return t; } return null; }
+  function findTex(o) { if (o.texture || (o.geom && o.geom.type === 'Image')) return o; for (var i = 0; i < o.kids.length; i++) { var t = findTex(o.kids[i]); if (t) return t; } return null; }
+  fields.forEach(function (fd) {
+    var l = document.createElement('label'); l.className = 'f';
+    l.innerHTML = '<span>' + (fd.id ? fd.id + ' · ' : '') + fd.label + '</span>';
+    var inp;
+    if (fd.kind === 'text') {
+      var tos = fd.os.map(findText).filter(Boolean), to = tos[0];
+      inp = document.createElement('textarea'); inp.rows = Math.max(1, Math.min(4, ((to && to.geom.text) || '').split('\n').length));
+      inp.value = to ? (to.text !== undefined ? to.text : to.geom.text) : '';
+      inp.oninput = function () { fd.os.forEach(function (x) { setText(x, inp.value); }); apply(cur); };
+    } else if (fd.kind === 'number') {
+      inp = document.createElement('input'); inp.type = 'text'; inp.inputMode = 'decimal';
+      inp.value = textOf(fd.o) || '';
+      inp.oninput = function () { fd.os.forEach(function (x) { x.rawValue = num(inp.value); setText(x, plug(x, 'Advanced_Counter') ? counterFormat(x, inp.value) : inp.value); }); apply(cur); };
+    } else if (fd.kind === 'image') {
+      var ios = fd.os.map(findTex).filter(Boolean);
+      inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*';
+      inp.onchange = function () {
+        var file = inp.files[0]; if (!file || !ios.length) return;
+        var img = new Image(); img.onload = function () { ios.forEach(function (x) { x.img = img; }); apply(cur); }; img.src = URL.createObjectURL(file);
+      };
+    } else {
+      inp = document.createElement('input'); inp.type = 'checkbox'; inp.checked = true; l.style.display = 'flex'; l.style.gap = '8px';
+      inp.onchange = function () { fd.os.forEach(function (x) { x.hidden = !inp.checked; }); apply(cur); };
+    }
+    l.appendChild(inp); form.appendChild(l);
+  });
+
+  // ---------- Viz function plug-ins (emulated) and Viz scripts ported to JavaScript ----------
+  function plug(o, type) { for (var i = 0; i < o.funcs.length; i++) if (o.funcs[i].type === type) return o.funcs[i].p; return null; }
+  function byName(n) { for (var i = 0; i < all.length; i++) if (all[i].name === n) return all[i]; return null; }
+  function textOf(o) { var t = o && findText(o); return t ? (t.text !== undefined ? t.text : t.geom.text) : ''; }
+  function num(s) { var v = parseFloat(String(s).replace(/\s/g, '').replace(',', '.')); return isNaN(v) ? 0 : v; }
+  var textHooks = {};                         // container name -> [handlers] (RegisterTextChangedCallback)
+  function onText(name, fn) { (textHooks[name] = textHooks[name] || []).push(fn); }
+  function setText(o, v, quiet) {
+    var t = o && findText(o); if (!t) return;
+    t.text = v;
+    if (quiet) return;
+    var names = [o.name]; if (t !== o) names.push(t.name);
+    names.forEach(function (n) { (textHooks[n] || []).forEach(function (fn) { fn(o); }); });
+  }
+  // Advanced_Counter: number formatting with a mask (#####.##) and a decimal separator
+  function counterFormat(o, value) {
+    var p = plug(o, 'Advanced_Counter'); if (!p) return String(value);
+    var m = String(p.inpmask || '').split('.'), dec = m.length > 1 ? m[1].length : 0;
+    var s = num(value).toFixed(dec);
+    return p.decsep === 1 ? s.replace('.', ',') : s;
+  }
+  function reformatCounter(o) { var p = plug(o, 'Advanced_Counter'); if (!p) return; setText(o, counterFormat(o, num(o.rawValue !== undefined ? o.rawValue : textOf(o))), false); }
+
+  var anims = [];                             // running parameter animations (Bar plug-in)
+  function animateTo(o, key, target, dur) {
+    var from = o[key] === undefined ? target : o[key];
+    anims = anims.filter(function (a) { return !(a.o === o && a.key === key); });
+    anims.push({ o: o, key: key, from: from, to: target, t0: performance.now(), dur: dur });
+    if (!playing) requestAnimationFrame(stepAnims);
+  }
+  function stepAnims(now) {
+    var live = false;
+    anims.forEach(function (a) { var x = Math.min(1, (now - a.t0) / a.dur); a.o[a.key] = a.from + (a.to - a.from) * ease(x); if (x < 1) live = true; });
+    anims = anims.filter(function (a) { return now - a.t0 < a.dur; });
+    apply(cur);
+    if (live && !playing) requestAnimationFrame(stepAnims);
+  }
+
+  function hasGeom(o) { return !!o.geom || o.kids.some(hasGeom); }
+  // Runs before each frame: plug-ins that move or show/hide containers
+  function runPlugins() {
+    runPerField();
+    all.forEach(function (o) {
+      var omo = plug(o, 'Omo');
+      if (omo) o.kids.forEach(function (k, i) { if (i > 0) k.active = omo.keep_vis ? i <= omo.vis_con : i === omo.vis_con; });
+      var grid = plug(o, 'Grid');
+      if (grid) o.kids.forEach(function (k, i) {
+        var cols = Math.max(1, grid.num_col || 1);
+        k.pos[0] = (i % cols) * (grid.col_offset || 0); k.pos[1] = -Math.floor(i / cols) * (grid.row_offset || 0);
+      });
+      var bv = plug(o, 'BarValues');
+      if (bv) {
+        var bars = []; (function f(n) { n.kids.forEach(function (k) { if (plug(k, 'Bar')) bars.push(k); f(k); }); })(o);
+        bars.forEach(function (b, i) {
+          var v = bv['Bar_Value__' + (i + 1)] || 0, bp = plug(b, 'Bar');
+          if (bv.Scale) v = v / 100 * (bv.BarMax || bp.BarMax || 100);
+          var r = Math.max(0, Math.min(1, (v - (bp.BarMin || 0)) / Math.max(1e-9, (bp.BarMax || 100) - (bp.BarMin || 0))));
+          var target = (bp.ObjMin || 0) + ((bp.ObjMax || 1) - (bp.ObjMin || 0)) * r;
+          if (b.barTarget !== target) { b.barTarget = target; animateTo(b, 'barNow', target, 500); }
+        });
+      }
+      var bp2 = plug(o, 'Bar');
+      if (bp2 && o.barNow !== undefined) { var ax = bp2.ScaleParam === 1 ? 0 : bp2.ScaleParam === 3 ? 2 : 1; o.scale[ax] = Math.max(1e-6, o.barNow); }
+    });
+    // bottom-up so that children are placed before their parents are justified
+    all.slice().reverse().forEach(function (o) {
+      var af = plug(o, 'Autofollow');
+      if (af && o.parent && af.REFER_CONTAINER === '0000') {
+        var sib = o.parent.kids, i = sib.indexOf(o), prev = null;
+        for (var j = i - 1; j >= 0; j--) if (sib[j].active && !sib[j].hidden) { prev = sib[j]; break; }
+        var d = af.DIRECTION === 0 ? 0 : 1, pb = prev && outerBox(prev), mb = innerBox(o);
+        if (pb && mb) o.pos[d] = pb[d * 2 + 1] + (af.DEFAULT_DISTANCE || 0) - mb[d * 2] * o.scale[d];
+      }
+      var ju = plug(o, 'Justifier');
+      if (ju && ju.aox === 3) {                       // centre the container's content on its origin (x)
+        var ib = innerBox(o, true);
+        if (ib) o.pos[0] = -(ib[0] + ib[1]) / 2 * o.scale[0];
+      }
+    });
+  }
+  // Bounding boxes ([x0, x1, y0, y1]) ignoring rotation: innerBox in the container's own space, outerBox in its parent's
+  function textBox(o) {
+    var g = o.geom, txt = o.text !== undefined ? o.text : g.text || '', size = 55;
+    ctx.save(); ctx.font = (window.ghBold ? 'bold ' : '') + size + 'px ' + FONT;
+    var w = Math.max.apply(null, txt.split('\n').map(function (l) { return ctx.measureText(l).width; })); ctx.restore();
+    var x0 = g.h === 3 ? -w : g.h === 2 ? -w / 2 : 0;
+    var y0 = g.v === 3 ? -size * 0.36 : g.v === 1 ? -size * 0.72 : 0;
+    return [x0, x0 + w, y0, y0 + size * 0.72];
+  }
+  function innerBox(o, kidsOnly) {
+    var bx = null;
+    function add(b) { if (!b) return; if (!bx) bx = b.slice(); else { bx[0] = Math.min(bx[0], b[0]); bx[1] = Math.max(bx[1], b[1]); bx[2] = Math.min(bx[2], b[2]); bx[3] = Math.max(bx[3], b[3]); } }
+    if (o.geom && !kidsOnly) {
+      if (o.geom.type === 'Text') add(textBox(o));
+      else { var g = geomBox(o); if (g) add([g.cx - g.w / 2, g.cx + g.w / 2, g.cy - g.h / 2, g.cy + g.h / 2]); }
+    }
+    o.kids.forEach(function (k) { if (k.active && !k.hidden) add(outerBox(k)); });
+    return bx;
+  }
+  function outerBox(o) {
+    var b = innerBox(o); if (!b) return null;
+    var sx = o.scale[0], sy = o.scale[1], cx = (o.center && o.center[0]) || 0, cy = (o.center && o.center[1]) || 0;
+    return [o.pos[0] + (b[0] - cx) * sx, o.pos[0] + (b[1] - cx) * sx, o.pos[1] + (b[2] - cy) * sy, o.pos[1] + (b[3] - cy) * sy];
+  }
+
+  // ---------- Viz Script interpreter: runs the scene's own scripts in the page ----------
+  // Supports the VBScript-like Viz Script language: dim, if/elseif/else, for/next, do/loop, while/wend,
+  // select case, sub/function, string methods, and the scene objects scripts use most
+  // (Scene.FindContainer, containers, geometry text, plug-in parameters, position/scaling/rotation/alpha).
+  var VS = (function () {
+    // ---- tokenizer ----
+    function tokenize(src) {
+      var toks = [], i = 0, n = src.length, line = 1;
+      function push(t, v) { toks.push({ t: t, v: v, line: line }); }
+      while (i < n) {
+        var c = src[i];
+        if (c === '\r') { i++; continue; }
+        if (c === '\n') { push('nl'); line++; i++; continue; }
+        if (c === ' ' || c === '\t' || c === '﻿' || c === ' ') { i++; continue; }
+        if (c === "'") { while (i < n && src[i] !== '\n') i++; continue; }
+        if (c === '_' && /^_[ \t]*\r?\n/.test(src.substr(i, 4))) { i = src.indexOf('\n', i) + 1; line++; continue; }
+        if (c === ':') { push('nl'); i++; continue; }
+        if (c === '"') {
+          var s = ''; i++;
+          while (i < n) { if (src[i] === '"') { if (src[i + 1] === '"') { s += '"'; i += 2; continue; } i++; break; } if (src[i] === '\n') break; s += src[i++]; }
+          push('str', s); continue;
+        }
+        var m = /^(\d+\.?\d*(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)/.exec(src.substr(i, 40));
+        if (m && !(c === '.' && toks.length && /^(id|\)|\])$/.test(toks[toks.length - 1].t === 'op' ? toks[toks.length - 1].v : toks[toks.length - 1].t))) { push('num', parseFloat(m[1])); i += m[1].length; continue; }
+        m = /^[A-Za-z_À-ɏ][\wÀ-ɏ]*/.exec(src.substr(i, 200));
+        if (m) {
+          var w = m[0].toLowerCase();
+          if (w === 'rem') { while (i < n && src[i] !== '\n') i++; continue; }
+          push('id', w); toks[toks.length - 1].raw = m[0]; i += m[0].length; continue;
+        }
+        var two = src.substr(i, 2);
+        if (two === '<>' || two === '<=' || two === '>=' || two === '==' || two === '!=') { push('op', two === '==' ? '=' : two === '!=' ? '<>' : two); i += 2; continue; }
+        if ('+-*/\\^&=<>(),.[]'.indexOf(c) >= 0) { push('op', c); i++; continue; }
+        i++;  // unknown character: skip
+      }
+      push('nl'); push('eof');
+      return toks;
+    }
+
+    // ---- parser ----
+    function parse(src) {
+      var T = tokenize(src), p = 0, subs = {};
+      function peek(o) { return T[p + (o || 0)]; }
+      function isId(v, o) { var t = peek(o); return t.t === 'id' && t.v === v; }
+      function isOp(v, o) { var t = peek(o); return t.t === 'op' && t.v === v; }
+      function next() { return T[p++]; }
+      function err(msg) { throw new Error('line ' + peek().line + ': ' + msg); }
+      function expectId(v) { if (!isId(v)) err('expected ' + v); return next(); }
+      function expectOp(v) { if (!isOp(v)) err('expected ' + v); return next(); }
+      function skipNl() { while (peek().t === 'nl') p++; }
+      function eol() { if (peek().t !== 'nl' && peek().t !== 'eof') err('unexpected ' + (peek().v || peek().t)); while (peek().t === 'nl') p++; }
+      function atEnd() { return peek().t === 'nl' || peek().t === 'eof' || isId('else'); }
+      function skipType() {          // "as Integer", "as Array[String]"
+        if (!isId('as')) return null;
+        next(); var ty = peek().v; var depth = 0;
+        while (peek().t !== 'eof') {
+          if (peek().t === 'nl' && depth === 0) break;
+          if (depth === 0 && (isOp(',') || isOp('=') || isOp(')'))) break;
+          if (isOp('[')) depth++; if (isOp(']')) depth--;
+          next();
+        }
+        return ty;
+      }
+      // expressions
+      function expr() { return binary(0); }
+      var LEVELS = [['or'], ['xor'], ['and'], ['not'], ['=', '<>', '<', '>', '<=', '>=', 'is'], ['&'], ['+', '-'], ['mod'], ['\\'], ['*', '/'], ['neg'], ['^']];
+      function binary(lv) {
+        if (lv >= LEVELS.length) return postfix();
+        var ops = LEVELS[lv];
+        if (ops[0] === 'not') { if (isId('not')) { next(); return { t: 'un', op: 'not', a: binary(lv) }; } return binary(lv + 1); }
+        if (ops[0] === 'neg') { if (isOp('-')) { next(); return { t: 'un', op: '-', a: binary(lv) }; } if (isOp('+')) { next(); return binary(lv); } return binary(lv + 1); }
+        var a = binary(lv + 1);
+        for (;;) {
+          var t = peek(), op = (t.t === 'op' || t.t === 'id') && ops.indexOf(t.v) >= 0 ? t.v : null;
+          if (!op) return a;
+          next(); a = { t: 'bin', op: op, a: a, b: binary(lv + 1) };
+        }
+      }
+      function args(close) {
+        var list = [];
+        if (isOp(close)) { next(); return list; }
+        for (;;) { list.push(expr()); if (isOp(',')) { next(); continue; } expectOp(close); return list; }
+      }
+      function primary() {
+        var t = next();
+        if (t.t === 'num') return { t: 'lit', v: t.v };
+        if (t.t === 'str') return { t: 'lit', v: t.v };
+        if (t.t === 'op' && t.v === '(') {
+          var e = expr();
+          if (isOp(',')) { var items = [e]; while (isOp(',')) { next(); items.push(expr()); } expectOp(')'); return { t: 'tuple', items: items }; }
+          expectOp(')'); return e;
+        }
+        if (t.t === 'op' && t.v === '.') { var nm = next(); return { t: 'mem', obj: { t: 'with' }, name: nm.v }; }
+        if (t.t === 'id') {
+          if (t.v === 'true') return { t: 'lit', v: true };
+          if (t.v === 'false') return { t: 'lit', v: false };
+          if (t.v === 'null' || t.v === 'nothing') return { t: 'lit', v: null };
+          if (t.v === 'new') { var ty = next(); while (isOp('[')) { next(); while (!isOp(']')) next(); next(); } return { t: 'new', ty: ty.v }; }
+          return { t: 'id', name: t.v };
+        }
+        err('unexpected ' + (t.v || t.t));
+      }
+      function postfix() {
+        var e = primary();
+        for (;;) {
+          if (isOp('.')) { next(); var nm = next(); if (nm.t !== 'id') err('expected a name after .'); e = { t: 'mem', obj: e, name: nm.v }; continue; }
+          if (isOp('(')) { next(); e = { t: 'call', f: e, args: args(')') }; continue; }
+          if (isOp('[')) { next(); e = { t: 'idx', obj: e, args: args(']') }; continue; }
+          return e;
+        }
+      }
+      // statements
+      function block(enders) {
+        var body = [];
+        for (;;) {
+          skipNl();
+          if (peek().t === 'eof') return body;
+          for (var k = 0; k < enders.length; k++) {
+            var en = enders[k].split(' ');
+            var ok = en.every(function (w, j) { return isId(w, j); });
+            if (ok) return body;
+          }
+          var s = statement(); if (s) body.push(s);
+        }
+      }
+      function endPair(w) { expectId('end'); expectId(w); }
+      function statement() {
+        var t = peek();
+        if (t.t !== 'id') { var e0 = postfix(); return exprStatement(e0); }
+        switch (t.v) {
+          case 'dim': case 'const': case 'static': case 'private': case 'public': case 'global': {
+            next(); if (isId('dim')) next();
+            var decls = [];
+            do {
+              if (isOp(',')) next();
+              var nm = next().v, size = null;
+              if (isOp('[') || isOp('(')) { var cl = isOp('[') ? ']' : ')'; next(); size = args(cl); }
+              var ty = skipType(), init = null;
+              if (isOp('=')) { next(); init = expr(); }
+              decls.push({ name: nm, ty: ty, init: init, size: size });
+            } while (isOp(','));
+            eol(); return { t: 'dim', decls: decls };
+          }
+          case 'set': case 'let': next(); return statement();
+          case 'call': next(); var ce = postfix(); eol(); return { t: 'expr', e: ce.t === 'call' ? ce : { t: 'call', f: ce, args: [] } };
+          case 'if': {
+            next(); var cond = expr(); expectId('then');
+            if (peek().t !== 'nl') {           // single-line if
+              var th = [simple()], el = [];
+              if (isId('else')) { next(); el.push(simple()); }
+              if (isId('end') && isId('if', 1)) { next(); next(); }
+              eol(); return { t: 'if', arms: [{ c: cond, b: th }], els: el };
+            }
+            eol();
+            var arms = [{ c: cond, b: block(['elseif', 'else', 'end if']) }], els = null;
+            for (;;) {
+              if (isId('elseif') || (isId('else') && isId('if', 1))) { if (isId('else')) next(); next(); var c2 = expr(); expectId('then'); eol(); arms.push({ c: c2, b: block(['elseif', 'else', 'end if']) }); continue; }
+              if (isId('else')) { next(); eol(); els = block(['end if']); }
+              endPair('if'); eol(); return { t: 'if', arms: arms, els: els };
+            }
+          }
+          case 'for': {
+            next();
+            if (isId('each')) { next(); var v0 = next().v; skipType(); expectId('in'); var coll = expr(); eol(); var bd = block(['next']); expectId('next'); if (peek().t === 'id') next(); eol(); return { t: 'foreach', v: v0, coll: coll, body: bd }; }
+            var v = next().v; skipType(); expectOp('='); var from = expr(); expectId('to'); var to = expr(), step = null;
+            if (isId('step')) { next(); step = expr(); }
+            eol(); var body = block(['next']); expectId('next'); if (peek().t === 'id') next(); eol();
+            return { t: 'for', v: v, from: from, to: to, step: step, body: body };
+          }
+          case 'do': {
+            next(); var pre = null, until = false;
+            if (isId('while') || isId('until')) { until = next().v === 'until'; pre = expr(); }
+            eol(); var b = block(['loop']); expectId('loop'); var post = null, puntil = false;
+            if (isId('while') || isId('until')) { puntil = next().v === 'until'; post = expr(); }
+            eol(); return { t: 'do', pre: pre, until: until, post: post, puntil: puntil, body: b };
+          }
+          case 'while': {
+            next(); var wc = expr(); eol(); var wb = block(['wend', 'end while', 'loop']);
+            if (isId('end')) { next(); next(); } else next(); eol();
+            return { t: 'do', pre: wc, until: false, body: wb };
+          }
+          case 'select': {
+            next(); expectId('case'); var sel = expr(); eol(); var cases = [], def = null;
+            skipNl();
+            while (isId('case')) {
+              next();
+              if (isId('else')) { next(); eol(); def = block(['case', 'end select']); continue; }
+              var tests = [];
+              do {
+                if (isOp(',')) next();
+                if (isId('is')) { next(); var op = next().v; tests.push({ op: op, e: expr() }); }
+                else { var a = expr(); if (isId('to')) { next(); tests.push({ lo: a, hi: expr() }); } else tests.push({ op: '=', e: a }); }
+              } while (isOp(','));
+              eol(); cases.push({ tests: tests, body: block(['case', 'end select']) });
+            }
+            endPair('select'); eol(); return { t: 'select', e: sel, cases: cases, def: def };
+          }
+          case 'exit': next(); var what = next().v; eol(); return { t: 'exit', what: what };
+          case 'return': next(); var rv = atEnd() ? null : expr(); eol(); return { t: 'return', e: rv };
+          case 'sub': case 'function': {
+            var isF = next().v === 'function', name = next().v, prm = [];
+            if (isOp('(')) {
+              next();
+              while (!isOp(')')) {
+                if (isOp(',')) { next(); continue; }
+                var byref = false;
+                if (isId('byref')) { next(); byref = true; } else if (isId('byval')) next();
+                var pn = next().v; skipType(); if (isOp('=')) { next(); expr(); }
+                prm.push({ name: pn, byref: byref });
+              }
+              next();
+            }
+            skipType(); eol();
+            var sb = block([isF ? 'end function' : 'end sub']); endPair(isF ? 'function' : 'sub'); eol();
+            subs[name] = { name: name, params: prm, body: sb, isF: isF };
+            return null;
+          }
+          case 'structure': case 'class': { while (!(isId('end') && (isId('structure', 1) || isId('class', 1)))) { if (peek().t === 'eof') return null; next(); } next(); next(); eol(); return null; }
+          case 'with': { next(); var we = expr(); eol(); var wbd = block(['end with']); endPair('with'); eol(); return { t: 'with', e: we, body: wbd }; }
+          case 'end': err('unexpected end ' + (peek(1).v || ''));
+        }
+        return simple(true);
+      }
+      function simple(needEol) {          // assignment or call
+        var e = postfix(), s = exprStatement(e, true);
+        if (needEol) eol();
+        return s;
+      }
+      function exprStatement(e, noEol) {
+        var s;
+        if (isOp('=')) { next(); s = { t: 'set', lhs: e, e: expr() }; }
+        else if (atEnd()) s = { t: 'expr', e: e.t === 'call' ? e : { t: 'call', f: e, args: [], bare: true } };
+        else {                             // call without parentheses: Foo a, b
+          var a = [expr()]; while (isOp(',')) { next(); a.push(expr()); }
+          s = { t: 'expr', e: { t: 'call', f: e, args: a } };
+        }
+        if (!noEol) eol();
+        return s;
+      }
+      var main = block([]);
+      return { main: main, subs: subs };
+    }
+
+    // ---- values ----
+    function VArray(n) { this.items = []; for (var i = 0; i < (n || 0); i++) this.items.push(null); }
+    function Vec(get, set) { this.get3 = get; this.set3 = set; }
+    function num(v) {
+      if (typeof v === 'number') return v;
+      if (typeof v === 'boolean') return v ? 1 : 0;
+      if (v === null || v === undefined) return 0;
+      var f = parseFloat(String(v).trim()); return isNaN(f) ? 0 : f;
+    }
+    function str(v) {
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+      if (typeof v === 'number') return Number.isInteger(v) ? String(v) : String(+v.toFixed(6));
+      if (v instanceof Vec) return v.get3().join(' ');
+      return String(v);
+    }
+    function isNumLike(v) { return typeof v === 'number' || typeof v === 'boolean' || (typeof v === 'string' && v.trim() !== '' && !isNaN(+v)); }
+    function eq(a, b) {
+      if (typeof a === 'string' && typeof b === 'string') return a === b;
+      if (isNumLike(a) && isNumLike(b)) return num(a) === num(b);
+      if (a === null || b === null) return a === b;
+      return a === b || str(a) === str(b);
+    }
+    function cmp(a, b) {
+      if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;
+      var x = num(a), y = num(b); return x < y ? -1 : x > y ? 1 : 0;
+    }
+    function truthy(v) { return typeof v === 'string' ? v !== '' && v.toLowerCase() !== 'false' && v !== '0' : !!v; }
+
+    // ---- string methods (Viz strings are mutable: mutating methods write the result back) ----
+    var STR = {
+      length: function (s) { return s.length; },
+      find: function (s, a) { return s.indexOf(str(a[0]), a[1] ? num(a[1]) : 0); },
+      findlastof: function (s, a) { return s.lastIndexOf(str(a[0])); },
+      findfirstof: function (s, a) { var set = str(a[0]), b = -1; for (var i = 0; i < s.length; i++) if (set.indexOf(s[i]) >= 0) { b = i; break; } return b; },
+      getchar: function (s, a) { return s.charAt(num(a[0])); },
+      getsubstring: function (s, a) { return s.substr(num(a[0]), a.length > 1 ? num(a[1]) : undefined); },
+      left: function (s, a) { return s.substr(0, num(a[0])); },
+      right: function (s, a) { return s.substr(Math.max(0, s.length - num(a[0]))); },
+      mid: function (s, a) { return s.substr(num(a[0]), a.length > 1 ? num(a[1]) : undefined); },
+      startswith: function (s, a) { return s.indexOf(str(a[0])) === 0; },
+      endswith: function (s, a) { var x = str(a[0]); return s.slice(-x.length) === x; },
+      match: function (s, a) { try { return new RegExp('^' + str(a[0]).replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$').test(s); } catch (e) { return false; } },
+      isempty: function (s) { return s === ''; },
+      tostring: function (s) { return s; },
+      split: function (s, a, self) { var parts = s.split(str(a[0]) || ' '); if (a[1] instanceof VArray) a[1].items = parts; return parts.length; }
+    };
+    var STRMUT = {
+      replacechar: function (s, a) { var i = num(a[0]); return i < 0 || i >= s.length ? s : s.substr(0, i) + str(a[1]).charAt(0) + s.substr(i + 1); },
+      substitute: function (s, a) { var f = str(a[0]), r = str(a[1]); if (!f) return s; return a[2] === false ? s.replace(f, r) : s.split(f).join(r); },
+      replace: function (s, a) { return STRMUT.substitute(s, a); },
+      trim: function (s) { return s.trim(); }, trimleft: function (s) { return s.replace(/^\s+/, ''); }, trimright: function (s) { return s.replace(/\s+$/, ''); },
+      makeupper: function (s) { return s.toUpperCase(); }, makelower: function (s) { return s.toLowerCase(); },
+      toupper: function (s) { return s.toUpperCase(); }, tolower: function (s) { return s.toLowerCase(); },
+      upcase: function (s) { return s.toUpperCase(); }, downcase: function (s) { return s.toLowerCase(); },
+      insert: function (s, a) { var i = num(a[0]); return s.substr(0, i) + str(a[1]) + s.substr(i); },
+      erase: function (s, a) { var i = num(a[0]); return s.substr(0, i) + s.substr(i + (a.length > 1 ? num(a[1]) : s.length)); },
+      append: function (s, a) { return s + str(a[0]); },
+      set: function (s, a) { return str(a[0]); },
+      clear: function () { return ''; }
+    };
+
+    // ---- built-in functions ----
+    var rnd = Math.random;
+    var BUILTIN = {
+      cint: function (a) { var v = a[0]; return typeof v === 'string' ? (parseInt(v, 10) || 0) : Math.round(num(v)); },
+      cdbl: function (a) { return num(a[0]); }, cstr: function (a) { return str(a[0]); }, cbool: function (a) { return truthy(a[0]); },
+      cfloat: function (a) { return num(a[0]); },
+      max: function (a) { return Math.max.apply(null, a.map(num)); }, min: function (a) { return Math.min.apply(null, a.map(num)); },
+      abs: function (a) { return Math.abs(num(a[0])); }, sqrt: function (a) { return Math.sqrt(num(a[0])); }, sqr: function (a) { return num(a[0]) * num(a[0]); },
+      sin: function (a) { return Math.sin(num(a[0]) * Math.PI / 180); }, cos: function (a) { return Math.cos(num(a[0]) * Math.PI / 180); },
+      tan: function (a) { return Math.tan(num(a[0]) * Math.PI / 180); }, atan: function (a) { return Math.atan(num(a[0])) * 180 / Math.PI; },
+      round: function (a) { var d = a.length > 1 ? Math.pow(10, num(a[1])) : 1; return Math.round(num(a[0]) * d) / d; },
+      floor: function (a) { return Math.floor(num(a[0])); }, ceil: function (a) { return Math.ceil(num(a[0])); }, int: function (a) { return Math.floor(num(a[0])); },
+      fix: function (a) { return Math.trunc(num(a[0])); }, sgn: function (a) { return Math.sign(num(a[0])); },
+      random: function (a) { return a.length ? Math.floor(rnd() * num(a[0])) : rnd(); }, rnd: function () { return rnd(); },
+      doubletostring: function (a) { return num(a[0]).toFixed(a.length > 1 ? num(a[1]) : 2); },
+      inttostring: function (a) { return String(Math.round(num(a[0]))); },
+      len: function (a) { return str(a[0]).length; }, ucase: function (a) { return str(a[0]).toUpperCase(); }, lcase: function (a) { return str(a[0]).toLowerCase(); },
+      left: function (a) { return str(a[0]).substr(0, num(a[1])); }, right: function (a) { var s = str(a[0]); return s.substr(Math.max(0, s.length - num(a[1]))); },
+      mid: function (a) { return str(a[0]).substr(num(a[1]) - 1, a.length > 2 ? num(a[2]) : undefined); },
+      instr: function (a) { return str(a[0]).indexOf(str(a[1])) + 1; }, trim: function (a) { return str(a[0]).trim(); },
+      asc: function (a) { return str(a[0]).charCodeAt(0) || 0; }, chr: function (a) { return String.fromCharCode(num(a[0])); },
+      isnumeric: function (a) { return isNumLike(a[0]); }, isempty: function (a) { return a[0] === null || a[0] === ''; },
+      vertex: function (a) { var v = [num(a[0]), num(a[1]), num(a[2])]; return new Vec(function () { return v; }, function (x) { v = x; }); }
+    };
+
+    // ---- scene objects ----
+    function lower(n) { return String(n).toLowerCase(); }
+    function vec3(arr, onSet) {
+      return new Vec(function () { return arr.slice(0, 3); }, function (v) { for (var i = 0; i < 3; i++) arr[i] = v[i]; if (onSet) onSet(); });
+    }
+    function toVec(v) { if (v instanceof Vec) return v.get3(); if (Array.isArray(v)) return v.map(num); var n = num(v); return [n, n, n]; }
+
+    function make(env) {           // env: hooks to the page renderer
+      var wrapCache = new Map();
+      function C(o) {
+        if (!o) return null;
+        if (wrapCache.has(o)) return wrapCache.get(o);
+        var w = { kind: 'container', o: o }; wrapCache.set(o, w); return w;
+      }
+      function plugin(o, type, p) { return { kind: 'plugin', o: o, type: type, p: p }; }
+      function geo(o) { return { kind: 'geometry', o: o }; }
+      function findIn(list, name) {
+        for (var i = 0; i < list.length; i++) if (list[i].name === name) return list[i];
+        var l = lower(name); for (i = 0; i < list.length; i++) if (lower(list[i].name) === l) return list[i];
+        return null;
+      }
+      function subTree(o) { var r = []; (function f(n) { n.kids.forEach(function (k) { r.push(k); f(k); }); })(o); return r; }
+      var scene = { kind: 'scene' };
+
+      function getMember(obj, name, owner) {
+        if (obj === null || obj === undefined) throw new Error('cannot read .' + name + ' of an empty object');
+        if (typeof obj === 'string') {
+          if (STR[name]) return STR[name](obj, []);
+          throw new Error('unknown string property ' + name);
+        }
+        if (obj instanceof Vec) {
+          var v = obj.get3();
+          if (name === 'x') return v[0]; if (name === 'y') return v[1]; if (name === 'z') return v[2]; if (name === 'xyz') return obj;
+          throw new Error('unknown vector property ' + name);
+        }
+        if (obj instanceof VArray) { if (name === 'size' || name === 'ubound' || name === 'length') return obj.items.length; throw new Error('unknown array property ' + name); }
+        switch (obj.kind) {
+          case 'scene':
+            if (name === 'stage') return { kind: 'stage' };
+            break;
+          case 'container': {
+            var o = obj.o;
+            switch (name) {
+              case 'name': return o.name;
+              case 'active': return !!o.active;
+              case 'visible': return !!o.active && !o.hidden;
+              case 'position': return vec3(o.pos, env.changed);
+              case 'scaling': return vec3(o.scale, env.changed);
+              case 'rotation': return vec3(o.rot, env.changed);
+              case 'center': return vec3(o.center, env.changed);
+              case 'alpha': return { kind: 'alpha', o: o };
+              case 'geometry': return geo(o);
+              case 'material': return { kind: 'material', o: o };
+              case 'childcontainer': return C(o.kids[0]);
+              case 'parentcontainer': return o.parent && o.parent.name !== 'scene' ? C(o.parent) : null;
+              case 'nextcontainer': case 'previouscontainer': {
+                var sib = o.parent ? o.parent.kids : [], i = sib.indexOf(o);
+                return C(sib[name === 'nextcontainer' ? i + 1 : i - 1]);
+              }
+              case 'childcontainercount': return o.kids.length;
+              case 'vispath': case 'path': return o.name;
+            }
+            break;
+          }
+          case 'geometry': {
+            var go = obj.o;
+            if (name === 'text') return env.textOf(go);
+            if (name === 'plugininstance') return go.geom ? plugin(go, go.geom.type, go.geom.p || (go.geom.p = {})) : null;
+            if (name === 'type') return go.geom ? go.geom.type : '';
+            break;
+          }
+          case 'alpha': if (name === 'value') return obj.o.alpha === undefined ? 100 : obj.o.alpha; break;
+          case 'material':
+            if (name === 'color') return obj.o.color ? vec3(obj.o.color, env.changed) : null;
+            if (name === 'alpha') return (obj.o.matAlpha === undefined ? 1 : obj.o.matAlpha) * 100;
+            break;
+          case 'stage': break;
+          case 'script': if (owner && obj.vars.has(name)) return obj.vars.get(name); break;
+        }
+        throw new Error('unsupported property .' + name + ' on ' + (obj.kind || typeof obj));
+      }
+      function setMember(obj, name, val) {
+        if (obj === null || obj === undefined) throw new Error('cannot set .' + name + ' of an empty object');
+        if (obj instanceof Vec) {
+          var v = obj.get3();
+          if (name === 'x') v[0] = num(val); else if (name === 'y') v[1] = num(val); else if (name === 'z') v[2] = num(val);
+          else if (name === 'xyz') v = toVec(val); else throw new Error('unknown vector property ' + name);
+          obj.set3(v); return;
+        }
+        switch (obj.kind) {
+          case 'container': {
+            var o = obj.o;
+            switch (name) {
+              case 'active': o.active = truthy(val); env.changed(); return;
+              case 'visible': o.hidden = !truthy(val); env.changed(); return;
+              case 'name': o.name = str(val); return;
+              case 'position': case 'scaling': case 'rotation': case 'center': {
+                var arr = { position: o.pos, scaling: o.scale, rotation: o.rot, center: o.center }[name], nv = toVec(val);
+                for (var i = 0; i < 3; i++) arr[i] = nv[i]; env.changed(); return;
+              }
+            }
+            break;
+          }
+          case 'geometry': if (name === 'text') { env.setText(obj.o, str(val)); return; } break;
+          case 'alpha': if (name === 'value') { obj.o.alpha = num(val); env.changed(); return; } break;
+          case 'material':
+            if (name === 'color') { obj.o.color = toVec(val).concat([1]).slice(0, 4); env.changed(); return; }
+            if (name === 'alpha') { obj.o.matAlpha = num(val) / 100; env.changed(); return; }
+            break;
+        }
+        throw new Error('cannot set .' + name + ' on ' + (obj.kind || typeof obj));
+      }
+      function callMethod(obj, name, a, ctx) {
+        if (obj === null || obj === undefined) throw new Error('cannot call ' + name + '() on an empty object (container not found?)');
+        if (obj instanceof Vec) { if (name === 'set') { obj.set3([num(a[0]), num(a[1]), num(a[2])]); return null; } if (name === 'get') return obj.get3(); }
+        if (obj instanceof VArray) {
+          switch (name) {
+            case 'push': obj.items.push(a[0]); return null;
+            case 'pop': return obj.items.pop();
+            case 'clear': obj.items = []; return null;
+            case 'size': case 'ubound': return obj.items.length;
+            case 'insert': obj.items.splice(num(a[0]), 0, a[1]); return null;
+            case 'erase': obj.items.splice(num(a[0]), 1); return null;
+          }
+        }
+        switch (obj.kind) {
+          case 'scene':
+            if (name === 'findcontainer') return C(findIn(env.all, str(a[0])));
+            if (name === 'updatescenetree' || name === 'update') return null;
+            break;
+          case 'container': {
+            var o = obj.o;
+            switch (name) {
+              case 'getfunctionplugininstance': { var t = str(a[0]); for (var i = 0; i < o.funcs.length; i++) if (lower(o.funcs[i].type) === lower(t)) return plugin(o, o.funcs[i].type, o.funcs[i].p); return null; }
+              case 'getgeometryplugininstance': return o.geom ? plugin(o, o.geom.type, o.geom.p || (o.geom.p = {})) : null;
+              case 'findsubcontainer': {
+                var parts = str(a[0]).split('$'), cur = o;
+                for (var j = 0; j < parts.length && cur; j++) cur = findIn(cur.kids, parts[j]) || (j === 0 ? findIn(subTree(o), parts[j]) : null);
+                return C(cur);
+              }
+              case 'getchildcontainerbyindex': return C(o.kids[num(a[0])]);
+              case 'getchildcontainercount': return o.kids.length;
+              case 'getdirector': return null;
+              case 'getgeometryname': case 'getgeometrytype': return o.geom ? o.geom.type : '';
+            }
+            break;
+          }
+          case 'geometry': {
+            var go = obj.o;
+            if (name === 'registertextchangedcallback') { env.watchText(go, ctx); return null; }
+            if (name === 'unregistertextchangedcallback') { env.unwatchText(go, ctx); return null; }
+            if (name === 'getplugininstance') return go.geom ? plugin(go, go.geom.type, go.geom.p || (go.geom.p = {})) : null;
+            if (name === 'settext') { env.setText(go, str(a[0])); return null; }
+            if (name === 'gettext') return env.textOf(go);
+            break;
+          }
+          case 'plugin': {
+            var m = /^(set|get)parameter(double|int|integer|float|string|bool|boolean|color|vertex)?$/.exec(name);
+            if (m) {
+              var key = str(a[0]);
+              if (m[1] === 'get') { var cur2 = obj.p[key]; if (/double|float|int/.test(m[2] || '')) return num(cur2); if (m[2] === 'string') return str(cur2); return cur2; }
+              var val = a[1];
+              if (m[2] === 'int' || m[2] === 'integer') val = Math.round(num(val));
+              else if (m[2] === 'double' || m[2] === 'float') val = num(val);
+              else if (m[2] === 'string') val = str(val);
+              else if (m[2] === 'bool' || m[2] === 'boolean') val = truthy(val);
+              else if (m[2] === 'vertex' || m[2] === 'color') val = toVec(val);
+              obj.p[key] = val; env.pluginChanged(obj.o, obj.type, key); return null;
+            }
+            if (name === 'pushbutton' || name === 'updateparameters' || name === 'initialize' || name === 'reset') { env.pluginChanged(obj.o, obj.type, name); return null; }
+            break;
+          }
+          case 'stage': return null;
+        }
+        throw new Error('unsupported method ' + name + '() on ' + (obj.kind || typeof obj));
+      }
+      return { C: C, scene: scene, getMember: getMember, setMember: setMember, callMethod: callMethod };
+    }
+
+    // ---- interpreter ----
+    function Script(o, src, env, host) {
+      this.o = o; this.env = env; this.host = host;
+      this.prog = parse(src);
+      this.vars = new Map(); this.params = {}; this.dimmed = new Set();
+      this.steps = 0;
+    }
+    var EXIT = {}, RETURN = {};
+    Script.prototype.run = function (body, frame) {
+      for (var i = 0; i < body.length; i++) {
+        var r = this.exec(body[i], frame);
+        if (r) return r;
+      }
+      return null;
+    };
+    Script.prototype.tick = function () { if (++this.steps > 2e5) throw new Error('script stopped: too many steps (endless loop?)'); };
+    Script.prototype.lookup = function (name, frame) {
+      if (frame && frame.vars.has(name)) return frame.vars;
+      if (this.vars.has(name)) return this.vars;
+      return null;
+    };
+    Script.prototype.defaultOf = function (ty, size) {
+      if (size) return new VArray(size.length ? num(this.eval(size[0], null)) : 0);
+      switch (lower(ty || '')) {
+        case 'integer': case 'int': case 'double': case 'float': case 'long': return 0;
+        case 'string': return '';
+        case 'boolean': case 'bool': return false;
+        case 'array': return new VArray(0);
+        case 'vertex': return BUILTIN.vertex([0, 0, 0]);
+      }
+      return null;
+    };
+    Script.prototype.exec = function (s, frame) {
+      this.tick();
+      var self = this, i, r;
+      switch (s.t) {
+        case 'dim':
+          s.decls.forEach(function (d) {
+            var target = frame ? frame.vars : self.vars;
+            if (!frame) self.dimmed.add(d.name);
+            target.set(d.name, d.init ? self.coerce(self.eval(d.init, frame), d.ty) : self.defaultOf(d.ty, d.size));
+          });
+          return null;
+        case 'set': this.assign(s.lhs, this.eval(s.e, frame), frame); return null;
+        case 'expr': this.eval(s.e, frame); return null;
+        case 'if':
+          for (i = 0; i < s.arms.length; i++) if (truthy(this.eval(s.arms[i].c, frame))) return this.run(s.arms[i].b, frame);
+          return s.els ? this.run(s.els, frame) : null;
+        case 'for': {
+          var from = num(this.eval(s.from, frame)), to = num(this.eval(s.to, frame)), step = s.step ? num(this.eval(s.step, frame)) : 1;
+          // a loop counter inside a sub is local unless it was declared with dim at script level
+          var vars = frame ? (frame.vars.has(s.v) || !this.dimmed.has(s.v) ? frame.vars : this.vars) : this.vars;
+          for (var x = from; step >= 0 ? x <= to : x >= to; x += step) {
+            vars.set(s.v, x);
+            r = this.run(s.body, frame);
+            if (r === EXIT) { if (this.exitWhat === 'for') { r = null; break; } return r; }
+            if (r) return r;
+            x = num(vars.get(s.v));
+            if (step === 0) break;
+          }
+          return null;
+        }
+        case 'foreach': {
+          var coll = this.eval(s.coll, frame), items = coll instanceof VArray ? coll.items.slice() : Array.isArray(coll) ? coll : [];
+          var fv = this.lookup(s.v, frame) || (frame ? frame.vars : this.vars);
+          for (i = 0; i < items.length; i++) { fv.set(s.v, items[i]); r = this.run(s.body, frame); if (r === EXIT && this.exitWhat === 'for') break; if (r) return r; }
+          return null;
+        }
+        case 'do':
+          for (;;) {
+            if (s.pre && truthy(this.eval(s.pre, frame)) === s.until) break;
+            r = this.run(s.body, frame);
+            if (r === EXIT) { if (this.exitWhat === 'do' || this.exitWhat === 'while') break; return r; }
+            if (r) return r;
+            if (s.post && truthy(this.eval(s.post, frame)) === s.puntil) break;
+            this.tick();
+          }
+          return null;
+        case 'select': {
+          var v = this.eval(s.e, frame);
+          for (i = 0; i < s.cases.length; i++) {
+            var hit = s.cases[i].tests.some(function (t) {
+              if (t.lo) return cmp(v, self.eval(t.lo, frame)) >= 0 && cmp(v, self.eval(t.hi, frame)) <= 0;
+              return self.compare(t.op, v, self.eval(t.e, frame));
+            });
+            if (hit) return this.run(s.cases[i].body, frame);
+          }
+          return s.def ? this.run(s.def, frame) : null;
+        }
+        case 'exit': this.exitWhat = s.what; return EXIT;
+        case 'return': if (frame && s.e) frame.ret = this.eval(s.e, frame); this.exitWhat = 'function'; return EXIT;
+        case 'with': { var saved = this.withObj; this.withObj = this.eval(s.e, frame); r = this.run(s.body, frame); this.withObj = saved; return r; }
+      }
+      throw new Error('unknown statement ' + s.t);
+    };
+    Script.prototype.coerce = function (v, ty) {
+      switch (lower(ty || '')) {
+        case 'integer': case 'int': case 'long': return typeof v === 'string' ? (parseInt(v, 10) || 0) : Math.round(num(v));
+        case 'double': case 'float': return num(v);
+        case 'string': return str(v);
+        case 'boolean': case 'bool': return truthy(v);
+      }
+      return v;
+    };
+    Script.prototype.compare = function (op, a, b) {
+      switch (op) {
+        case '=': return eq(a, b); case '<>': return !eq(a, b);
+        case '<': return cmp(a, b) < 0; case '>': return cmp(a, b) > 0;
+        case '<=': return cmp(a, b) <= 0; case '>=': return cmp(a, b) >= 0;
+        case 'is': return a === b;
+      }
+      return false;
+    };
+    Script.prototype.assign = function (lhs, val, frame) {
+      if (val instanceof Vec && lhs.t === 'id') val = BUILTIN.vertex(val.get3());
+      if (lhs.t === 'id') {
+        var vars = this.lookup(lhs.name, frame);
+        if (!vars && frame && frame.fn === lhs.name) { frame.ret = val; return; }
+        (vars || (frame ? frame.vars : this.vars)).set(lhs.name, vars && vars.get(lhs.name) instanceof VArray && !(val instanceof VArray) ? val : val);
+        return;
+      }
+      if (lhs.t === 'mem') { this.host.setMember(this.evalObj(lhs.obj, frame), lhs.name, val); return; }
+      if (lhs.t === 'idx' || (lhs.t === 'call' && lhs.f.t === 'id')) {
+        var arr = this.eval(lhs.t === 'idx' ? lhs.obj : lhs.f, frame);
+        if (arr instanceof VArray) { var k = num(this.eval(lhs.args[0], frame)); while (arr.items.length <= k) arr.items.push(null); arr.items[k] = val; return; }
+      }
+      throw new Error('cannot assign to this expression');
+    };
+    Script.prototype.evalObj = function (e, frame) { return e.t === 'with' ? this.withObj : this.eval(e, frame); };
+    Script.prototype.eval = function (e, frame) {
+      var self = this;
+      switch (e.t) {
+        case 'lit': return e.v;
+        case 'tuple': var tv = e.items.map(function (x) { return num(self.eval(x, frame)); }); return BUILTIN.vertex(tv);
+        case 'new': return e.ty === 'array' ? new VArray(0) : this.defaultOf(e.ty);
+        case 'id': {
+          var vars = this.lookup(e.name, frame);
+          if (vars) return vars.get(e.name);
+          if (frame && frame.fn === e.name) return frame.ret;
+          switch (e.name) {
+            case 'scene': return this.host.scene;
+            case 'this': return this.host.C(this.o);
+            case 'system': case 'stage': return { kind: 'stage' };
+          }
+          if (this.prog.subs[e.name]) return this.callSub(e.name, [], frame);
+          if (BUILTIN[e.name]) return BUILTIN[e.name]([]);
+          return null;                     // undeclared variable: empty, like VBScript
+        }
+        case 'un': { var a = this.eval(e.a, frame); return e.op === 'not' ? (typeof a === 'number' && !Number.isInteger(a) ? !a : typeof a === 'number' ? ~a : !truthy(a)) : -num(a); }
+        case 'bin': {
+          if (e.op === 'and' || e.op === 'or' || e.op === 'xor') {
+            var l = this.eval(e.a, frame), r = this.eval(e.b, frame);
+            if (typeof l === 'number' && typeof r === 'number') return e.op === 'and' ? l & r : e.op === 'or' ? l | r : l ^ r;
+            l = truthy(l); r = truthy(r); return e.op === 'and' ? l && r : e.op === 'or' ? l || r : l !== r;
+          }
+          var x = this.eval(e.a, frame), y = this.eval(e.b, frame);
+          switch (e.op) {
+            case '&': return str(x) + str(y);
+            case '+':
+              if (x instanceof Vec || y instanceof Vec) { var p = toVec(x), q = toVec(y); return BUILTIN.vertex([p[0] + q[0], p[1] + q[1], p[2] + q[2]]); }
+              if (typeof x === 'string' && typeof y === 'string') return x + y;
+              return num(x) + num(y);
+            case '-':
+              if (x instanceof Vec || y instanceof Vec) { var p2 = toVec(x), q2 = toVec(y); return BUILTIN.vertex([p2[0] - q2[0], p2[1] - q2[1], p2[2] - q2[2]]); }
+              return num(x) - num(y);
+            case '*':
+              if (x instanceof Vec || y instanceof Vec) { var p3 = toVec(x), q3 = toVec(y); return BUILTIN.vertex([p3[0] * q3[0], p3[1] * q3[1], p3[2] * q3[2]]); }
+              return num(x) * num(y);
+            case '/': return num(x) / num(y);
+            case '\\': return Math.trunc(num(x) / num(y));
+            case 'mod': return num(x) % num(y);
+            case '^': return Math.pow(num(x), num(y));
+          }
+          return this.compare(e.op, x, y);
+        }
+        case 'mem': {
+          var obj = this.evalObj(e.obj, frame);
+          if (typeof obj === 'string' && (STR[e.name] || STRMUT[e.name])) return this.strCall(e, obj, e.name, [], frame);
+          return this.host.getMember(obj, e.name);
+        }
+        case 'idx': {
+          var arr = this.eval(e.obj, frame), k = num(this.eval(e.args[0], frame));
+          if (arr instanceof VArray) return arr.items[k] === undefined ? null : arr.items[k];
+          if (typeof arr === 'string') return arr.charAt(k);
+          throw new Error('cannot index this value');
+        }
+        case 'call': {
+          var f = e.f, args = e.args.map(function (x) { return self.eval(x, frame); });
+          if (f.t === 'id') {
+            if (this.prog.subs[f.name]) return this.callSub(f.name, args, frame, e.args);
+            var av = this.lookup(f.name, frame);
+            if (av && av.get(f.name) instanceof VArray) { var it = av.get(f.name).items[num(args[0])]; return it === undefined ? null : it; }
+            if (BUILTIN[f.name]) return BUILTIN[f.name](args);
+            if (f.name === 'println' || f.name === 'print') { this.env.log(args.map(str).join(' ')); return null; }
+            if (/^registerparameter/.test(f.name)) { this.params[lower(str(args[0]))] = args.length > 2 ? args[2] : null; return null; }
+            if (/^getparameter/.test(f.name)) { return this.params[lower(str(args[0]))]; }
+            if (/^(registerinfotext|registerpushbutton|registerparametercontainer|sendcommand|registerplugin)/.test(f.name)) return null;
+            if (frame && frame.fn === f.name && !args.length) return frame.ret;
+            throw new Error('unknown function ' + f.name + '()');
+          }
+          if (f.t === 'mem') {
+            var target = this.evalObj(f.obj, frame);
+            if (typeof target === 'string') return this.strCall(f, target, f.name, args, frame);
+            if (target instanceof VArray && e.bare) return this.host.callMethod(target, f.name, args, this);
+            if (target && target.kind === 'geometry' && f.name === 'text' && e.bare) return this.host.getMember(target, 'text');
+            if (e.bare && target && (target.kind === 'container' || target.kind === 'geometry' || target.kind === 'alpha' || target instanceof Vec)) {
+              try { return this.host.getMember(target, f.name); } catch (er) { /* a method call without parentheses */ }
+            }
+            return this.host.callMethod(target, f.name, args, this);
+          }
+          if (f.t === 'idx' || f.t === 'call') return this.eval(f, frame);
+          throw new Error('cannot call this expression');
+        }
+        case 'with': return this.withObj;
+      }
+      throw new Error('unknown expression ' + e.t);
+    };
+    Script.prototype.strCall = function (memNode, s, name, args, frame) {
+      if (STR[name]) return STR[name](s, args);
+      var out = STRMUT[name](s, args);
+      try { this.assign(memNode.obj, out, frame); } catch (er) { /* not assignable: result only */ }
+      return out;
+    };
+    Script.prototype.callSub = function (name, args, frame, argNodes) {
+      var sub = this.prog.subs[name], self = this;
+      var nf = { vars: new Map(), fn: sub.isF ? name : null, ret: null };
+      sub.params.forEach(function (p, i) { nf.vars.set(p.name, i < args.length ? args[i] : null); });
+      if (this.depth > 60) throw new Error('script stopped: recursion too deep');
+      this.depth = (this.depth || 0) + 1;
+      try { this.run(sub.body, nf); } finally { this.depth--; }
+      sub.params.forEach(function (p, i) {       // ByRef parameters written back
+        if (p.byref && argNodes && argNodes[i] && (argNodes[i].t === 'id')) { try { self.assign(argNodes[i], nf.vars.get(p.name), frame); } catch (e) { /* ignore */ } }
+      });
+      return nf.ret;
+    };
+    Script.prototype.has = function (name) { return !!this.prog.subs[name]; };
+    Script.prototype.callback = function (name, args) {
+      if (!this.prog.subs[name] || this.dead) return;
+      this.steps = 0;
+      try { this.callSub(name, args || [], null); }
+      catch (e) { this.env.log(this.o.name + ': ' + e.message, true); if (/too many steps|recursion/.test(e.message)) this.dead = true; }
+    };
+    Script.prototype.start = function () {
+      this.steps = 0;
+      try {
+        if (this.has('oninitparameters')) this.callSub('oninitparameters', [], null);
+        this.run(this.prog.main, null);
+        if (this.has('oninit')) this.callSub('oninit', [], null);
+      } catch (e) { this.env.log(this.o.name + ': ' + e.message, true); }
+    };
+
+    return { parse: parse, Script: Script, make: make, num: num, str: str };
+  })();
+
+  // ---------- the scene's own Viz scripts, run by the interpreter above ----------
+  var scripts = [], scriptLog = [], watched = [], cbDepth = 0, renderPending = false;
+  function renderSoon() { if (renderPending) return; renderPending = true; requestAnimationFrame(function () { renderPending = false; if (!playing) apply(cur); }); }
+  var vsEnv = {
+    all: all,
+    textOf: function (o) { return textOf(o); },
+    setText: function (o, v) { setText(o, v); renderSoon(); },
+    changed: renderSoon,
+    pluginChanged: function (o, type) { if (/^advanced_counter$/i.test(type)) reformatCounter(o); renderSoon(); },
+    watchText: function (o, sc) {
+      if (watched.some(function (w) { return w.o === o && w.sc === sc; })) return;
+      var w = { o: o, sc: sc, fn: function () {
+        if (cbDepth > 8) return;
+        cbDepth++; try { sc.callback('ongeometrychanged', [{ kind: 'geometry', o: o }]); } finally { cbDepth--; }
+      } };
+      watched.push(w); onText(o.name, w.fn);
+    },
+    unwatchText: function (o, sc) {
+      watched = watched.filter(function (w) {
+        if (w.o !== o || w.sc !== sc) return true;
+        textHooks[o.name] = (textHooks[o.name] || []).filter(function (f) { return f !== w.fn; }); return false;
+      });
+    },
+    log: function (m, isErr) { scriptLog.push((isErr ? '⚠ ' : '') + m); if (isErr) console.warn('[Viz script] ' + m); }
+  };
+  var vsHost = VS.make(vsEnv), inPerField = false;
+  function runPerField() {
+    if (inPerField || !scripts.length) return;
+    inPerField = true;
+    try { scripts.forEach(function (sc) { if (sc.has('onexecperfield')) sc.callback('onexecperfield'); }); } finally { inPerField = false; }
+  }
+  function startScripts() {
+    all.forEach(function (o) {
+      if (!o.script || !o.script.trim()) return;
+      try { scripts.push(new VS.Script(o, o.script, vsEnv, vsHost)); }
+      catch (e) { vsEnv.log(o.name + ': cannot read the script (' + e.message + ')', true); }
+    });
+    scripts.forEach(function (sc) { sc.start(); });
+    // apply the current data once, as if each watched text had just been typed
+    watched.slice().forEach(function (w) { w.fn(); });
+    // texts that scripts watch but that have no control field get their own box in the form
+    var inputs = [];
+    watched.forEach(function (w) {
+      var o = w.o, t = findText(o);
+      if (!t || inputs.indexOf(o) >= 0) return;
+      var covered = fields.some(function (fd) { return fd.os.some(function (x) { return x === o || findText(x) === t; }); });
+      if (!covered) inputs.push(o);
+    });
+    if (inputs.length) {
+      var h = document.createElement('h3'); h.textContent = 'Script inputs'; form.appendChild(h);
+      inputs.forEach(function (o) {
+        var l = document.createElement('label'); l.className = 'f'; l.innerHTML = '<span>' + o.name + '</span>';
+        var inp = document.createElement('input'); inp.type = 'text'; inp.value = textOf(o);
+        inp.oninput = function () { setText(o, inp.value); apply(cur); };
+        l.appendChild(inp); form.appendChild(l);
+      });
+    }
+    if (scripts.length) {
+      var d = document.createElement('details'); d.className = 'note';
+      var errs = scriptLog.filter(function (m) { return m.charAt(0) === '⚠'; }).length;
+      d.innerHTML = '<summary>Viz scripts: ' + scripts.length + ' running' + (errs ? ', ' + errs + ' message(s)' : '') + '</summary>';
+      var pre = document.createElement('pre'); pre.style.whiteSpace = 'pre-wrap'; pre.style.fontSize = '11px';
+      function refresh() { pre.textContent = scripts.map(function (s) { return '• ' + s.o.name + (s.dead ? ' (stopped)' : ''); }).join('\n') + (scriptLog.length ? '\n\n' + scriptLog.slice(-40).join('\n') : ''); }
+      refresh(); d.addEventListener('toggle', refresh);
+      d.appendChild(pre); form.appendChild(d);
+    }
+    window.ghScripts = scripts; window.ghScriptLog = scriptLog;
+  }
+
+  // ---------- images found in the Graphic Hub ----------
+  var imgs = (S.images || []).map(function (x) { var im = new Image(); im.src = x.src; return { u: x.u, n: x.n, img: im }; });
+  var texs = all.filter(function (o) { return o.texture || (o.geom && o.geom.type === 'Image'); });
+  if (texs.length) {
+    var h2 = document.createElement('h2'); h2.textContent = 'Textures'; form.appendChild(h2);
+    if (!imgs.length) { var nt = document.createElement('p'); nt.className = 'note'; nt.textContent = 'No referenced image was found in the Graphic Hub: load your own with the file buttons.'; form.appendChild(nt); }
+    texs.forEach(function (o) {
+      var l = document.createElement('label'); l.className = 'f';
+      l.innerHTML = '<span>' + o.name + '</span>';
+      var sel = document.createElement('select');
+      sel.innerHTML = '<option value="">(placeholder)</option>' + imgs.map(function (x, i) { return '<option value="' + i + '">' + x.n + '</option>'; }).join('');
+      var guess = -1;
+      imgs.forEach(function (x, i) { if (guess < 0 && x.n && (o.name.toLowerCase().indexOf(x.n.toLowerCase()) >= 0 || x.n.toLowerCase().indexOf(o.name.toLowerCase()) >= 0)) guess = i; });
+      var main = texs.filter(function (x) { return !/flare|glow|shine|light|blur|shadow|reflex/i.test(x.name); });
+      if (guess < 0 && imgs.length === main.length && main.indexOf(o) >= 0) guess = main.indexOf(o);
+      if (guess >= 0) { sel.value = String(guess); o.img = imgs[guess].img; imgs[guess].img.onload = function () { apply(cur); }; }
+      sel.onchange = function () { o.img = sel.value === '' ? null : imgs[+sel.value].img; apply(cur); };
+      var up = document.createElement('input'); up.type = 'file'; up.accept = 'image/*'; up.style.marginTop = '4px';
+      up.onchange = function () { var f = up.files[0]; if (!f) return; var im = new Image(); im.onload = function () { o.img = im; apply(cur); }; im.src = URL.createObjectURL(f); };
+      l.appendChild(sel); l.appendChild(up); form.appendChild(l);
+    });
+  }
+  if (S.fonts && S.fonts.length) {
+    var fn = document.createElement('p'); fn.className = 'note';
+    fn.textContent = 'Fonts referenced in the Graphic Hub: ' + S.fonts.map(function (x) { return x.n + ' [' + x.u.substr(0, 8) + ']'; }).join(', ') + '. Viz fonts cannot be used in a browser; text uses ' + FONT.split(',')[0] + '.';
+    form.appendChild(fn);
+  }
+  var bl = document.createElement('label'); bl.className = 'note'; bl.innerHTML = '<input type="checkbox" id="bold"> Bold text';
+  form.appendChild(bl); document.getElementById('bold').onchange = function () { window.ghBold = this.checked; apply(cur); };
+
+  // ---------- layer tree ----------
+  var treeEl = document.getElementById('tree');
+  (function list(o, d) {
+    o.kids.forEach(function (k) {
+      var r = document.createElement('div');
+      r.textContent = ' '.repeat(d * 2) + k.name + (k.geom ? '  · ' + k.geom.type : '') + (k.anims.length ? '  ◆' : '') + (k.script ? '  {script}' : '') + (k.maskSrc ? '  [mask]' : '');
+      if (!k.active) r.className = 'off';
+      treeEl.appendChild(r); list(k, d + 1);
+    });
+  })(root, 0);
+  var sk = Object.keys(skipped);
+  if (sk.length) document.getElementById('skipped').textContent = 'Not rendered (unsupported plugins): ' + sk.map(function (k) { return k + ' ×' + skipped[k]; }).join(', ');
+  document.getElementById('summary').textContent = all.length + ' containers · ' + fields.length + ' fields · ' + (duration ? duration.toFixed(2) + ' s of animation' : 'no animation') + (stops.length ? ' · stop points ' + stops.map(function (x) { return x.toFixed(2); }).join(', ') : '');
+
+  // ---------- playback (stops at the director's stop points, like Viz) ----------
+  var cur = 0, playing = false, t0 = 0, target = 0, timeEl = document.getElementById('time'), clock = document.getElementById('clock');
+  var end = Math.max(duration, 0.001);
+  function show(t) { cur = t; apply(t); timeEl.value = Math.round(1000 * t / end); clock.textContent = t.toFixed(2) + ' / ' + duration.toFixed(2) + ' s'; }
+  function nextStop(t) { for (var i = 0; i < stops.length; i++) if (stops[i] > t + 1e-6) return stops[i]; return end; }
+  function tick(now) {
+    if (!playing) return;
+    var t = (now - t0) / 1000;
+    if (t >= target) {
+      if (target >= end && document.getElementById('loop').checked) { t0 = now; t = 0; target = nextStop(0); }
+      else { playing = false; show(target); return; }
+    }
+    show(t); requestAnimationFrame(tick);
+  }
+  function run(from) { cur = from; target = nextStop(from); playing = true; t0 = performance.now() - from * 1000; requestAnimationFrame(tick); }
+  document.getElementById('play').onclick = function () { run(0); };
+  document.getElementById('cont').onclick = function () { run(cur >= end ? 0 : cur); };
+  document.getElementById('stop').onclick = function () { playing = false; show(0); };
+  timeEl.oninput = function () { playing = false; show(end * timeEl.value / 1000); };
+  window.ghAll = all; window.ghSeek = show; window.ghDuration = duration; window.ghStops = stops;
+
+  // ---------- view ----------
+  var frame = document.getElementById('frame'), vp = document.getElementById('viewport');
+  function fit() { var s = Math.min((vp.clientWidth - 24) / 1920, (vp.clientHeight - 24) / 1080); frame.style.transform = 'scale(' + s + ')'; frame.style.marginRight = (1920 * (s - 1)) + 'px'; frame.style.marginBottom = (1080 * (s - 1)) + 'px'; }
+  window.addEventListener('resize', fit); fit();
+  var mi = document.getElementById('minv'); mi.checked = maskInvert; mi.onchange = function () { maskInvert = mi.checked; apply(cur); };
+  document.getElementById('bg').onchange = function () { frame.className = 'bg-' + this.value; };
+  var ref = document.getElementById('ref');
+  if (S.preview) ref.src = 'data:image/jpeg;base64,' + S.preview; else document.getElementById('refop').disabled = true;
+  document.getElementById('refop').oninput = function () { ref.style.opacity = this.value / 100; };
+  startScripts(); window.ghSetText = function (n, v) { setText(byName(n), v); apply(cur); };
+  show(stops.length ? stops[0] : duration);   // first stop point = the state shown in the Viz preview
+})();
+</script>
+</body>
+</html>
+'@
+
+function Invoke-GhScripts($a) {
+    $root = Get-GhRoot
+    if ($a.Opt.all -or -not $a.Pos.Count) {
+        # scan every scene of the Graphic Hub
+        $scenes = @(Get-GhIndex | Where-Object { $_.Kind -eq 'Scene' })
+        Write-GhTitle "Scenes containing Viz scripts ($($scenes.Count) scenes scanned)"
+        $found = 0; $n = 0
+        foreach ($s in $scenes) {
+            $n++; Write-Progress -Activity 'Scanning scenes for scripts' -Status "$n / $($scenes.Count)" -PercentComplete ([int](100 * $n / [Math]::Max(1, $scenes.Count)))
+            try { $list = [GhTool.Vdb]::SceneScripts([GhTool.Vdb]::Inspect($s.Path)) } catch { continue }
+            if ($list.Count) {
+                $found++
+                $lines = 0; foreach ($x in $list) { $lines += ($x[1] -split "`n").Count }
+                Write-Gh ("  {0}  [{1}]  {2} script(s), {3} lines: {4}" -f $s.Name, $s.Uuid.Substring(0, 8), $list.Count, $lines, (($list | ForEach-Object { $_[0] }) -join ', '))
+            }
+        }
+        Write-Progress -Activity 'Scanning scenes for scripts' -Completed
+        Write-Gh "  $found scene(s) with scripts. Extract one with: gh scripts <id> -Out <folder>" DarkGray
+        return
+    }
+    $path = Resolve-GhObject ($a.Pos -join ' ')
+    $i = [GhTool.Vdb]::Inspect($path)
+    if ($i.Kind -ne 'Scene') { throw "Object $($i.Uuid) is not a scene ($($i.Kind))." }
+    $list = [GhTool.Vdb]::SceneScripts($i)
+    Write-GhTitle "Scripts in $($i.Name) [$($i.Uuid.Substring(0, 8))]"
+    if (-not $list.Count) { Write-Gh '  This scene has no script.'; return }
+    $out = if ($a.Opt.out) { Assert-GhOutside $a.Opt.out } else { Assert-GhOutside (Join-Path (Get-Location).ProviderPath ("{0}_{1}_scripts" -f (Get-SafeName $i.Name), $i.Uuid.Substring(0, 8))) }
+    $k = 0
+    foreach ($x in $list) {
+        $k++
+        $file = Join-Path $out ("{0:D2}_{1}.vs" -f $k, (Get-SafeName $x[0]))
+        $header = "' Viz script from scene '$($i.Name)' [$($i.Uuid)], container '$($x[0])'`r`n"
+        [IO.File]::WriteAllText($file, $header + ($x[1] -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding($true)))
+        Write-Gh ("  {0,-28} {1,5} lines  -> {2}" -f $x[0], ($x[1] -split "`n").Count, (Split-Path $file -Leaf))
+    }
+    Write-GhOk "$($list.Count) script(s) saved in $out"
+}
+
 function Show-GhHelp {
     Write-Host ''
     Write-Host "  GHTool $script:GhVersion - Viz Graphic Hub data folder tool" -ForegroundColor Cyan
@@ -2177,6 +4555,11 @@ function Show-GhHelp {
       -Size <px> (256)  -Fast (embedded 64 px thumbnails, instant)  -Full (+ full-resolution PNG)
       -Out <folder>  -Refresh  -NoOpen
   gh preview <id> [-Width n]  Preview the image in the terminal (ANSI colours)
+  gh scene2html <id>          Turn a scene into an HTML page: layers, animation (with stop points),
+                              a form for its control fields, textures from the GH when found
+      -Out <file|folder>  -Font "<CSS font family>"  -NoRefs  -NoOpen
+  gh scripts                  List the scenes that contain Viz scripts
+  gh scripts <id> [-Out dir]  Save a scene's scripts as .vs text files
   gh logs                     List the log files
   gh logs -Tail [n] [-File name]        Last lines of a log (newest by default)
   gh logs -Grep <regex> [-All] [-Top n] Search the logs
@@ -2207,7 +4590,7 @@ function Show-GhHelp {
 # ---------------------------------------------------------------------------
 #  Argument parsing and command dispatch
 # ---------------------------------------------------------------------------
-$script:GhSwitches = @('deep', 'all', 'grid', 'physical', 'raw', 'refresh', 'force', 'noflip', 'thumbs', 'tail', 'fast', 'full', 'noopen', 'apply', 'touch')
+$script:GhSwitches = @('deep', 'all', 'grid', 'physical', 'raw', 'refresh', 'force', 'noflip', 'thumbs', 'tail', 'fast', 'full', 'noopen', 'apply', 'touch', 'norefs')
 
 function ConvertTo-GhArgs([string[]]$tokens) {
     $pos = New-Object System.Collections.Generic.List[string]
@@ -2244,6 +4627,8 @@ function Invoke-GhCommand([string[]]$tokens) {
             '^(export|extract)$' { Invoke-GhExport $a }
             '^(gallery|web)$' { Invoke-GhGallery $a }
             '^(preview|view)$' { Invoke-GhPreview $a }
+            '^(scene2html|scene-html|html)$' { Invoke-GhScene2Html $a }
+            '^scripts?$' { Invoke-GhScripts $a }
             '^(logs?|log)$' { Invoke-GhLogs $a }
             '^(health|status-lines)$' { Invoke-GhHealth $a }
             '^tables$' { Invoke-GhTables }
